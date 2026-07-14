@@ -233,97 +233,7 @@ def extract_pdf_text(file_bytes):
 
 
 # =============================================================
-#  Lectura de fotos con OCR local — gratis, sin IA, sin API
-#  (usa RapidOCR: se instala solo con pip, no necesita ningun
-#  programa de sistema como Tesseract, asi que es compatible con
-#  entornos serverless como Vercel)
-# =============================================================
-class OCRNotAvailable(Exception):
-    pass
-
-
-_OCR_ENGINE = None
-
-
-def _get_ocr_engine():
-    global _OCR_ENGINE
-    if _OCR_ENGINE is None:
-        from rapidocr_onnxruntime import RapidOCR
-        # Forzar 1 hilo por motor: en el plan gratis (512 MB) usar varios hilos
-        # dispara el uso de memoria y el proceso se cae (error 502).
-        _OCR_ENGINE = RapidOCR(
-            det_use_cuda=False, cls_use_cuda=False, rec_use_cuda=False,
-            intra_op_num_threads=1, inter_op_num_threads=1,
-        )
-    return _OCR_ENGINE
-
-
-# Lado más largo máximo al que se reduce la imagen antes del OCR.
-# Más pequeño = menos memoria (clave en el plan gratis), pero menos detalle.
-OCR_MAX_SIDE = 1600
-
-
-def ocr_image_text(file_bytes):
-    """Lee el texto de una foto usando un motor de OCR local (sin llamadas externas)."""
-    from PIL import Image, ImageOps
-    import numpy as np
-    import gc
-
-    try:
-        img = Image.open(BytesIO(file_bytes))
-        img = ImageOps.exif_transpose(img)  # corrige la rotacion que guardan los celulares
-        img = img.convert("RGB")
-    except Exception as e:
-        raise ValueError(f"No se pudo abrir la imagen: {e}")
-
-    # Redimensionar SIEMPRE a un lado máximo controlado: las fotos de celular
-    # suelen ser enormes (4000px+) y procesarlas agota la memoria del plan gratis.
-    w, h = img.size
-    longest = max(w, h)
-    if longest > OCR_MAX_SIDE:
-        scale = OCR_MAX_SIDE / longest
-        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
-
-    arr = np.array(img)
-    img.close()
-    del img
-
-    try:
-        engine = _get_ocr_engine()
-        result, _ = engine(arr)
-    except Exception as e:
-        print(f"[OCR] fallo al usar RapidOCR: {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        raise OCRNotAvailable(str(e))
-    finally:
-        del arr
-        gc.collect()
-
-    if not result:
-        return ""
-    lines = [line[1] for line in result if len(line) > 1]
-    return "\n".join(lines).strip()
-
-
-def ocr_pdf_as_image(file_bytes):
-    """Convierte cada pagina de un PDF sin texto real (un escaneo) a imagen y le aplica OCR."""
-    import fitz  # PyMuPDF
-
-    texts = []
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    try:
-        for page in doc:
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
-            t = ocr_image_text(pix.tobytes("png"))
-            if t:
-                texts.append(t)
-    finally:
-        doc.close()
-    return "\n".join(texts).strip()
-
-
-# =============================================================
-#  Lectura de factura con IA (foto o PDF) — requiere ANTHROPIC_API_KEY
+#  Lectura de factura con IA de visión (OpenAI) — requiere OPENAI_API_KEY
 # =============================================================
 class MissingAPIKey(Exception):
     pass
@@ -341,56 +251,75 @@ def _extract_json_object(text):
     return json.loads(text[start:end + 1])
 
 
+INVOICE_PROMPT = (
+    "Analiza esta factura o recibo de consumo. Responde SOLO con un JSON valido, sin texto adicional ni "
+    "comentarios, con esta forma exacta: "
+    '{"place":"nombre del establecimiento","date":"YYYY-MM-DD","subtotal":0,"total":0,'
+    '"items":[{"desc":"nombre del item","qty":1,"unitPrice":0,"kind":"shared"}]}. '
+    "place es el nombre del negocio en el encabezado del recibo. "
+    "date es la fecha del consumo, convertida a formato YYYY-MM-DD. "
+    "subtotal es el monto antes de impuestos (base imponible) y total es el monto final a pagar, "
+    "incluyendo impuestos y cargos. Si no encuentras alguno de estos datos, usa null. "
+    'Usa kind="shared" para comida para compartir (pizzas, platos grandes, entradas para la mesa) y '
+    'kind="individual" para bebidas o platos individuales (cualquier bebida, cerveza, vino, refresco, '
+    "agua, jugo, coctel, o plato que normalmente pide y come una sola persona). "
+    "qty es la cantidad (numero entero) y unitPrice el precio unitario en pesos, sin simbolos ni "
+    "separadores de miles. Si el recibo muestra el precio total de la linea en vez del unitario, "
+    "calcula el unitario dividiendo el total entre la cantidad. "
+    "No incluyas como item las lineas de total, subtotal, impuestos, descuento, propina o cambio."
+)
+
+
 def extract_invoice_data(file_bytes, mime_type):
+    """Lee la factura con la IA de visión de OpenAI. Requiere OPENAI_API_KEY."""
     import requests
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise MissingAPIKey()
 
-    model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
+    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     b64 = base64.b64encode(file_bytes).decode()
-    block = (
-        {"type": "document", "source": {"type": "base64", "media_type": mime_type, "data": b64}}
-        if mime_type == "application/pdf" else
-        {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": b64}}
-    )
 
-    prompt = (
-        "Analiza esta factura o recibo de consumo. Responde SOLO con un JSON valido, sin texto adicional ni "
-        "comentarios, con esta forma exacta: "
-        '{"place":"nombre del establecimiento","date":"YYYY-MM-DD","subtotal":0,"total":0,'
-        '"items":[{"desc":"nombre del item","qty":1,"unitPrice":0,"kind":"shared"}]}. '
-        "place es el nombre del negocio en el encabezado del recibo. "
-        "date es la fecha del consumo, convertida a formato YYYY-MM-DD. "
-        "subtotal es el monto antes de impuestos (base imponible) y total es el monto final a pagar, "
-        "incluyendo impuestos y cargos. Si no encuentras alguno de estos datos, usa null. "
-        'Usa kind="shared" para comida para compartir (pizzas, platos grandes, entradas para la mesa) y '
-        'kind="individual" para bebidas o platos individuales (cualquier bebida, cerveza, vino, refresco, '
-        "agua, jugo, coctel, o plato que normalmente pide y come una sola persona). "
-        "qty es la cantidad (numero entero) y unitPrice el precio unitario en pesos, sin simbolos ni "
-        "separadores de miles. Si el recibo muestra el precio total de la linea en vez del unitario, "
-        "calcula el unitario dividiendo el total entre la cantidad. "
-        "No incluyas como item las lineas de total, subtotal, impuestos, descuento, propina o cambio."
-    )
+    if mime_type == "application/pdf":
+        # OpenAI (chat completions) lee imágenes, no PDF directamente. Convertimos
+        # la primera página del PDF a imagen. (Los PDF con texto real ya se leyeron antes.)
+        try:
+            import fitz  # PyMuPDF
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            pix = doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
+            b64 = base64.b64encode(pix.tobytes("png")).decode()
+            doc.close()
+            data_url = f"data:image/png;base64,{b64}"
+        except Exception as e:
+            raise ValueError(f"No se pudo convertir el PDF a imagen: {e}")
+    else:
+        data_url = f"data:{mime_type};base64,{b64}"
 
     resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
+        "https://api.openai.com/v1/chat/completions",
         headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
         },
         json={
             "model": model,
             "max_tokens": 1800,
-            "messages": [{"role": "user", "content": [block, {"type": "text", "text": prompt}]}],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": INVOICE_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }],
         },
-        timeout=45,
+        timeout=60,
     )
+    if resp.status_code == 401:
+        raise ValueError("La clave de OpenAI no es válida o fue revocada.")
     resp.raise_for_status()
     data = resp.json()
-    text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    text = data["choices"][0]["message"]["content"]
     return _extract_json_object(text)
 
 
@@ -636,7 +565,7 @@ def api_extract_invoice():
     if not raw:
         return jsonify({"error": "empty", "message": "El archivo llegó vacío."}), 200
 
-    # PDF: primero intenta leer el texto real del archivo (gratis, sin OCR ni IA).
+    # PDF: primero intenta leer el texto real del archivo (gratis, sin IA).
     # Solo funciona si el PDF trae texto de verdad, no si es una foto/escaneo.
     if mime == "application/pdf":
         try:
@@ -648,45 +577,18 @@ def api_extract_invoice():
             if items:
                 meta = detect_totals_and_meta(pdf_text)
                 return jsonify({"items": items, "meta": meta})
-        # si no se encontró texto util, sigue abajo e intenta con OCR local
+        # si no se encontró texto util, sigue abajo e intenta con la IA de visión
 
-    # Foto (o PDF escaneado sin texto real): intenta leer con OCR local, gratis y sin IA.
-    ocr_text = ""
-    ocr_failed = False
-    ocr_error_detail = None
-    try:
-        if mime == "application/pdf":
-            ocr_text = ocr_pdf_as_image(raw)
-        else:
-            ocr_text = ocr_image_text(raw)
-    except OCRNotAvailable as e:
-        ocr_failed = True
-        ocr_error_detail = str(e) or "motor de OCR no disponible"
-        print(f"[OCR] no disponible: {e}", flush=True)
-    except Exception as e:
-        ocr_failed = True
-        ocr_error_detail = f"{type(e).__name__}: {e}"
-        print(f"[OCR] error inesperado antes de leer: {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-
-    if ocr_text:
-        items = parse_invoice_text(ocr_text)
-        if items:
-            meta = detect_totals_and_meta(ocr_text)
-            return jsonify({"items": items, "meta": meta})
-
+    # Foto (o PDF escaneado sin texto real): leer con la IA de visión de OpenAI.
     try:
         parsed = extract_invoice_data(raw, mime)
     except MissingAPIKey:
-        if ocr_failed:
-            msg = ("No se pudo leer la foto con el OCR "
-                   f"[detalle: {ocr_error_detail}]. Prueba con una foto más nítida, usa 'Pegar texto' o agrega los items a mano.")
-        else:
-            msg = ("No se pudo reconocer texto útil en la imagen (puede estar muy inclinada, borrosa o "
-                   "con poca luz). Prueba con una foto más nítida y derecha, usa 'Pegar texto' o agrega "
-                   "los items a mano.")
+        msg = ("La lectura de fotos necesita una OPENAI_API_KEY configurada en Vercel. "
+               "Mientras tanto, usa 'Pegar texto' o agrega los items a mano.")
         return jsonify({"error": "no_api_key", "message": msg}), 200
     except Exception as e:
+        print(f"[IA] error al leer factura: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
         return jsonify({"error": "extract_failed", "message": f"No se pudo leer la factura: {e}"}), 200
 
     items = parsed.get("items", []) if isinstance(parsed, dict) else []
@@ -936,7 +838,7 @@ PAGE = r"""<!DOCTYPE html>
             <input type="file" id="invoiceFile" accept="image/*,application/pdf">
           </label>
           <div style="font-size:11.5px; color:var(--ink-soft); margin-top:6px;">
-            Los PDF con texto real y las fotos se leen automáticamente y gratis. Para mejores resultados con fotos, toma la imagen derecha, con buena luz y de cerca.
+            Los PDF con texto real se leen gratis. Las fotos se leen con IA (requiere clave de OpenAI configurada). Para mejores resultados, toma la foto derecha y con buena luz.
           </div>
           <div class="divider">— o —</div>
           <label>Pega el texto de la factura</label>
