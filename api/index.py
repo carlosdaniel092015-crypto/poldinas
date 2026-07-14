@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os
 import re
+import traceback
 from io import BytesIO
 
 from flask import Flask, request, jsonify, send_file, Response
@@ -272,8 +273,10 @@ def ocr_image_text(file_bytes):
     try:
         engine = _get_ocr_engine()
         result, _ = engine(np.array(img))
-    except Exception:
-        raise OCRNotAvailable()
+    except Exception as e:
+        print(f"[OCR] fallo al usar RapidOCR: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        raise OCRNotAvailable(str(e))
 
     if not result:
         return ""
@@ -629,15 +632,21 @@ def api_extract_invoice():
     # Foto (o PDF escaneado sin texto real): intenta leer con OCR local, gratis y sin IA.
     ocr_text = ""
     ocr_failed = False
+    ocr_error_detail = None
     try:
         if mime == "application/pdf":
             ocr_text = ocr_pdf_as_image(raw)
         else:
             ocr_text = ocr_image_text(raw)
-    except OCRNotAvailable:
+    except OCRNotAvailable as e:
         ocr_failed = True
-    except Exception:
+        ocr_error_detail = str(e) or "motor de OCR no disponible"
+        print(f"[OCR] no disponible: {e}", flush=True)
+    except Exception as e:
         ocr_failed = True
+        ocr_error_detail = f"{type(e).__name__}: {e}"
+        print(f"[OCR] error inesperado antes de leer: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
 
     if ocr_text:
         items = parse_invoice_text(ocr_text)
@@ -649,8 +658,8 @@ def api_extract_invoice():
         parsed = extract_invoice_data(raw, mime)
     except MissingAPIKey:
         if ocr_failed:
-            msg = ("El lector automático (OCR) no está disponible en este servidor todavía. "
-                   "Usa 'Pegar texto' o agrega los items a mano mientras se ajusta.")
+            msg = ("El lector automático (OCR) no está disponible en este servidor todavía "
+                   f"[detalle: {ocr_error_detail}]. Usa 'Pegar texto' o agrega los items a mano.")
         else:
             msg = ("No se pudo reconocer texto útil en la imagen (puede estar muy inclinada, borrosa o "
                    "con poca luz). Prueba con una foto más nítida y derecha, usa 'Pegar texto' o agrega "
@@ -1258,7 +1267,9 @@ async function download(url){
 }
 
 /* ---------- toast ---------- */
-let tT=null; function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(tT); tT=setTimeout(()=>t.classList.remove('show'),2600); }
+let tT=null; function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(tT);
+  const dur = Math.min(9000, Math.max(2600, msg.length*70));
+  tT=setTimeout(()=>t.classList.remove('show'),dur); t.onclick=()=>{t.classList.remove('show'); clearTimeout(tT);}; }
 
 /* ---------- bind ---------- */
 function bind(){ const on=(id,ev,fn)=>document.getElementById(id).addEventListener(ev,fn);
