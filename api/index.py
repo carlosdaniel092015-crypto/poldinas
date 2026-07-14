@@ -232,6 +232,73 @@ def extract_pdf_text(file_bytes):
 
 
 # =============================================================
+#  Lectura de fotos con OCR local — gratis, sin IA, sin API
+#  (usa RapidOCR: se instala solo con pip, no necesita ningun
+#  programa de sistema como Tesseract, asi que es compatible con
+#  entornos serverless como Vercel)
+# =============================================================
+class OCRNotAvailable(Exception):
+    pass
+
+
+_OCR_ENGINE = None
+
+
+def _get_ocr_engine():
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        from rapidocr_onnxruntime import RapidOCR
+        _OCR_ENGINE = RapidOCR()
+    return _OCR_ENGINE
+
+
+def ocr_image_text(file_bytes):
+    """Lee el texto de una foto usando un motor de OCR local (sin llamadas externas)."""
+    from PIL import Image, ImageOps
+    import numpy as np
+
+    try:
+        img = Image.open(BytesIO(file_bytes))
+        img = ImageOps.exif_transpose(img)  # corrige la rotacion que guardan los celulares
+        img = img.convert("RGB")
+    except Exception as e:
+        raise ValueError(f"No se pudo abrir la imagen: {e}")
+
+    w, h = img.size
+    if max(w, h) < 1500:
+        scale = 1500 / max(w, h)
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+    try:
+        engine = _get_ocr_engine()
+        result, _ = engine(np.array(img))
+    except Exception:
+        raise OCRNotAvailable()
+
+    if not result:
+        return ""
+    lines = [line[1] for line in result if len(line) > 1]
+    return "\n".join(lines).strip()
+
+
+def ocr_pdf_as_image(file_bytes):
+    """Convierte cada pagina de un PDF sin texto real (un escaneo) a imagen y le aplica OCR."""
+    import fitz  # PyMuPDF
+
+    texts = []
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    try:
+        for page in doc:
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            t = ocr_image_text(pix.tobytes("png"))
+            if t:
+                texts.append(t)
+    finally:
+        doc.close()
+    return "\n".join(texts).strip()
+
+
+# =============================================================
 #  Lectura de factura con IA (foto o PDF) — requiere ANTHROPIC_API_KEY
 # =============================================================
 class MissingAPIKey(Exception):
@@ -545,7 +612,7 @@ def api_extract_invoice():
     if not raw:
         return jsonify({"error": "empty", "message": "El archivo llegó vacío."}), 200
 
-    # PDF: primero intenta leer el texto real del archivo (gratis, sin IA).
+    # PDF: primero intenta leer el texto real del archivo (gratis, sin OCR ni IA).
     # Solo funciona si el PDF trae texto de verdad, no si es una foto/escaneo.
     if mime == "application/pdf":
         try:
@@ -557,17 +624,37 @@ def api_extract_invoice():
             if items:
                 meta = detect_totals_and_meta(pdf_text)
                 return jsonify({"items": items, "meta": meta})
-        # si no se encontró texto util, sigue abajo e intenta con IA (si hay key)
+        # si no se encontró texto util, sigue abajo e intenta con OCR local
+
+    # Foto (o PDF escaneado sin texto real): intenta leer con OCR local, gratis y sin IA.
+    ocr_text = ""
+    ocr_failed = False
+    try:
+        if mime == "application/pdf":
+            ocr_text = ocr_pdf_as_image(raw)
+        else:
+            ocr_text = ocr_image_text(raw)
+    except OCRNotAvailable:
+        ocr_failed = True
+    except Exception:
+        ocr_failed = True
+
+    if ocr_text:
+        items = parse_invoice_text(ocr_text)
+        if items:
+            meta = detect_totals_and_meta(ocr_text)
+            return jsonify({"items": items, "meta": meta})
 
     try:
         parsed = extract_invoice_data(raw, mime)
     except MissingAPIKey:
-        if mime == "application/pdf":
-            msg = ("Este PDF parece ser una foto o escaneo (no tiene texto real adentro), así que no se pudo "
-                   "leer sin IA. Usa 'Pegar texto' o agrega los items a mano.")
+        if ocr_failed:
+            msg = ("El lector automático (OCR) no está disponible en este servidor todavía. "
+                   "Usa 'Pegar texto' o agrega los items a mano mientras se ajusta.")
         else:
-            msg = ("La lectura automática de fotos necesita una ANTHROPIC_API_KEY configurada en Vercel. "
-                   "Mientras tanto, usa 'Pegar texto' o agrega los items a mano.")
+            msg = ("No se pudo reconocer texto útil en la imagen (puede estar muy inclinada, borrosa o "
+                   "con poca luz). Prueba con una foto más nítida y derecha, usa 'Pegar texto' o agrega "
+                   "los items a mano.")
         return jsonify({"error": "no_api_key", "message": msg}), 200
     except Exception as e:
         return jsonify({"error": "extract_failed", "message": f"No se pudo leer la factura: {e}"}), 200
@@ -819,7 +906,7 @@ PAGE = r"""<!DOCTYPE html>
             <input type="file" id="invoiceFile" accept="image/*,application/pdf">
           </label>
           <div style="font-size:11.5px; color:var(--ink-soft); margin-top:6px;">
-            Los PDF con texto real (no escaneados) se leen sin costo. Las fotos necesitan IA configurada (opcional).
+            Los PDF con texto real se leen sin costo. Las fotos se intentan leer con OCR local (gratis, sin IA); si la foto está muy inclinada o borrosa puede no reconocer nada.
           </div>
           <div class="divider">— o —</div>
           <label>Pega el texto de la factura</label>
