@@ -7,8 +7,9 @@ App para repartir la cuenta cuando el equipo va a consumir las poldinas (multas)
 - **Personas**: agregas a cada integrante. La cantidad de poldinas de cada uno se calcula sola, a partir de las multas que le registres (no la escribes a mano).
 - **Registrar poldina**: cada multa queda guardada con persona, fecha, hora, motivo (Taza sucia o fuera de lugar, Luz encendida, Aire encendido, Dejó el carnet, u Otro) y una descripción libre opcional.
 - **Factura**:
-  - Puedes **subir una foto o PDF** de la factura y la app intenta leerla automáticamente, separando lo que es para compartir (pizzas, comida grande) de lo individual (bebidas, postres personales). *Esto requiere configurar una `ANTHROPIC_API_KEY` en Vercel — ver más abajo.*
-  - Sin esa configuración, puedes **pegar el texto de la factura** (copiado o escrito a mano) y un lector de texto (sin IA, gratis, siempre disponible) reconoce líneas como `2 Pizza mediana 24000` o `Gaseosa 3000`.
+  - Si subes un **PDF con texto real** (no una foto guardada como PDF, sino uno generado digitalmente por el sistema de facturación), la app lo lee automáticamente **sin ningún costo ni configuración** — usa una librería de Python (`pdfplumber`) que extrae el texto que ya existe en el archivo, sin inteligencia artificial.
+  - Si subes una **foto** (o un PDF que en realidad es una imagen escaneada, sin texto real adentro), la app intenta leerla con IA. *Esto requiere configurar una `ANTHROPIC_API_KEY` en Vercel — ver más abajo.* Sin esa configuración, la app te avisa y puedes usar "Pegar texto" o agregar los items a mano.
+  - Sin ninguna configuración, siempre puedes **pegar el texto de la factura** (copiado o escrito a mano) y un lector de texto (sin IA, gratis, siempre disponible) reconoce líneas como `2 Pizza mediana 24000` o `Gaseosa 3000`.
   - Los items leídos quedan en una zona de revisión donde ajustas cantidad, precio, tipo (Común/Individual) y a quién asignar antes de confirmarlos.
   - También puedes agregar items a mano en cualquier momento.
 - **Cálculo automático**: las multas cubren el consumo común. Si el consumo se pasa de lo que cubren las multas, el exceso se reparte por partes iguales entre quienes no tienen multa (o entre todos, si nadie está libre de multa). Los items individuales los paga cada quien.
