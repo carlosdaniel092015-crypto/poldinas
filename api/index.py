@@ -1,9 +1,3 @@
-import base64
-import json
-import mimetypes
-import os
-import re
-import traceback
 from io import BytesIO
 
 from flask import Flask, request, jsonify, send_file, Response
@@ -29,28 +23,14 @@ def inum(v, d=0):
 
 
 def money(n):
-    """Formato pesos dominicanos: RD$ 24,000"""
-    s = f"{int(round(n or 0)):,}"
-    return f"RD$ {s}"
+    """Formato pesos colombianos: $ 24.000"""
+    s = f"{int(round(n or 0)):,}".replace(",", ".")
+    return f"$ {s}"
 
 
 def latin(s):
     """Deja el texto seguro para las fuentes base del PDF."""
     return str(s or "").encode("latin-1", "replace").decode("latin-1")
-
-
-DRINK_KEYWORDS = [
-    "gaseosa", "cerveza", "cola", "malta", "jugo", "agua", "refresco",
-    "limonada", "te", "café", "cafe", "poker", "aguila", "águila",
-    "soda", "bebida", "vino", "whisky", "aguardiente", "ron", "michelada",
-    "presidente", "heineken", "corona", "modelo", "brahma", "stella",
-    "paulaner", "pellegrino", "sprite", "cocacola", "coca cola",
-]
-
-
-def guess_kind(desc):
-    d = (desc or "").lower()
-    return "individual" if any(k in d for k in DRINK_KEYWORDS) else "shared"
 
 
 # =============================================================
@@ -60,38 +40,32 @@ def compute(state):
     event = state.get("event", {}) or {}
     pv = num(event.get("poldinaValue"), 1000) or 1000
     people = state.get("people", []) or []
-    fines = state.get("fines", []) or []
-    items = state.get("items", []) or []
+    shared = state.get("shared", []) or []
+    extras = state.get("extras", []) or []
 
-    fines_by_person = {}
-    for f in fines:
-        pid = f.get("personId")
-        fines_by_person[pid] = fines_by_person.get(pid, 0) + 1
-
-    total_pold = sum(fines_by_person.values())
+    total_pold = sum(inum(p.get("poldinas")) for p in people)
     pool = total_pold * pv
-
-    shared_items = [i for i in items if i.get("kind") != "individual"]
-    indiv_items = [i for i in items if i.get("kind") == "individual"]
-    indiv_assigned = [i for i in indiv_items if i.get("personId")]
-    indiv_unassigned = [i for i in indiv_items if not i.get("personId")]
-
-    shared_cost = sum(num(i.get("qty")) * num(i.get("unitPrice")) for i in shared_items)
+    shared_cost = sum(num(i.get("qty")) * num(i.get("unitPrice")) for i in shared)
     excess = max(0.0, shared_cost - pool)
     surplus = max(0.0, pool - shared_cost)
     covered = min(shared_cost, pool)
 
-    excess_per = (excess / len(people)) if people else 0.0
+    non_fined = [p for p in people if inum(p.get("poldinas")) == 0]
+    base = non_fined
+    fallback = False
+    if excess > 0 and len(non_fined) == 0:
+        base = people
+        fallback = True
+    excess_per = (excess / len(base)) if base else 0.0
+    base_ids = {p.get("id") for p in base}
 
     rows = []
     for p in people:
-        pold = fines_by_person.get(p.get("id"), 0)
+        pold = inum(p.get("poldinas"))
         fine = pold * pv
-        ex = sum(
-            num(i.get("qty")) * num(i.get("unitPrice"))
-            for i in indiv_assigned if i.get("personId") == p.get("id")
-        )
-        eshare = excess_per if excess > 0 else 0.0
+        ex = sum(num(e.get("amount")) for e in extras if e.get("personId") == p.get("id"))
+        pays = excess > 0 and p.get("id") in base_ids
+        eshare = excess_per if pays else 0.0
         rows.append({
             "id": p.get("id"),
             "name": p.get("name") or "(sin nombre)",
@@ -103,8 +77,7 @@ def compute(state):
             "fined": pold > 0,
         })
 
-    extras_total = sum(num(i.get("qty")) * num(i.get("unitPrice")) for i in indiv_assigned)
-    unassigned_total = sum(num(i.get("qty")) * num(i.get("unitPrice")) for i in indiv_unassigned)
+    extras_total = sum(num(e.get("amount")) for e in extras)
     grand = sum(r["total"] for r in rows)
 
     return {
@@ -116,219 +89,12 @@ def compute(state):
         "excess": excess,
         "surplus": surplus,
         "extrasTotal": extras_total,
-        "unassignedTotal": unassigned_total,
-        "unassignedCount": len(indiv_unassigned),
         "grand": grand,
         "excessPer": excess_per,
+        "nonFinedCount": len(non_fined),
+        "fallback": fallback,
         "rows": rows,
     }
-
-
-# =============================================================
-#  Lectura de factura: pegar texto (sin IA, siempre disponible)
-# =============================================================
-PATTERNS = [
-    re.compile(r"^\s*(?P<qty>\d+)\s*[xX]\s*(?P<desc>.+?)\s+\$?\s*(?P<price>[\d.,]+)\s*$"),   # 2x Pizza mediana 24000
-    re.compile(r"^\s*(?P<desc>.+?)\s+[xX]\s*(?P<qty>\d+)\s+\$?\s*(?P<price>[\d.,]+)\s*$"),   # Pizza mediana x2 24000
-    re.compile(r"^\s*(?P<qty>\d+)\s+(?P<desc>.+?)\s+\$?\s*(?P<price>[\d.,]+)\s*$"),          # 2 Pizza mediana 24000
-    re.compile(r"^\s*(?P<desc>.+?)\s+\$?\s*(?P<price>[\d.,]+)\s*$"),                          # Pizza mediana 24000
-]
-
-
-SKIP_KEYWORDS = [
-    "total", "subtotal", "base imponible", "itbis", "descuento", "cambio",
-    "entregado", "propina", "servicio", "impuesto", "rnc", "ncf", "factura",
-    "mesa", "mesero", "cajero", "cliente", "salonero", "hora", "fecha",
-    "forma de pago", "ley ",
-]
-
-
-def parse_invoice_text(text):
-    items = []
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        low = line.lower()
-        if any(k in low for k in SKIP_KEYWORDS):
-            continue
-        m = None
-        for pat in PATTERNS:
-            m = pat.match(line)
-            if m:
-                break
-        if not m:
-            continue
-        gd = m.groupdict()
-        qty = int(gd.get("qty") or 1)
-        price_raw = gd["price"].replace(",", "")
-        try:
-            price = float(price_raw)
-        except ValueError:
-            continue
-        desc = gd["desc"].strip(" -:\t")
-        if not desc or price <= 0:
-            continue
-        unit_price = price / qty if qty else price
-        items.append({
-            "desc": desc,
-            "qty": qty,
-            "unitPrice": round(unit_price),
-            "kind": guess_kind(desc),
-        })
-    return items
-
-
-DATE_RE = re.compile(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})")
-
-
-def _to_number(s):
-    return float(s.replace(",", ""))
-
-
-def detect_totals_and_meta(text):
-    meta = {}
-    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
-    if lines:
-        meta["place"] = lines[0][:80]
-    for line in lines:
-        low = line.lower()
-        num_m = re.search(r"([\d.,]+)\s*$", line)
-        if not num_m:
-            continue
-        try:
-            value = _to_number(num_m.group(1))
-        except ValueError:
-            continue
-        if ("subtotal" in low or "base imponible" in low) and "subtotal" not in meta:
-            meta["subtotal"] = value
-        elif low.startswith("total") and "total" not in meta:
-            meta["total"] = value
-    dm = DATE_RE.search(text or "")
-    if dm:
-        d, mo, y = dm.groups()
-        y = ("20" + y) if len(y) == 2 else y
-        try:
-            meta["date"] = f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
-        except ValueError:
-            pass
-    return meta
-
-
-# =============================================================
-#  Lectura de PDF con texto real — gratis, sin IA
-#  (solo funciona si el PDF tiene texto de verdad adentro, no si es
-#  una foto/escaneo guardado como PDF)
-# =============================================================
-def extract_pdf_text(file_bytes):
-    import pdfplumber
-
-    parts = []
-    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text() or ""
-            if t:
-                parts.append(t)
-    return "\n".join(parts).strip()
-
-
-# =============================================================
-#  Lectura de factura con IA de visión (OpenAI) — requiere OPENAI_API_KEY
-# =============================================================
-class MissingAPIKey(Exception):
-    pass
-
-
-def _extract_json_object(text):
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1:
-        raise ValueError("La respuesta no contenía JSON.")
-    return json.loads(text[start:end + 1])
-
-
-INVOICE_PROMPT = (
-    "Analiza esta factura o recibo de consumo. Responde SOLO con un JSON valido, sin texto adicional ni "
-    "comentarios, con esta forma exacta: "
-    '{"place":"nombre del establecimiento","date":"YYYY-MM-DD","subtotal":0,"total":0,'
-    '"items":[{"desc":"nombre del item","qty":1,"unitPrice":0,"kind":"shared"}]}. '
-    "place es el nombre del negocio en el encabezado del recibo. "
-    "date es la fecha del consumo, convertida a formato YYYY-MM-DD. "
-    "subtotal es el monto antes de impuestos (base imponible) y total es el monto final a pagar, "
-    "incluyendo impuestos y cargos. Si no encuentras alguno de estos datos, usa null. "
-    'Usa kind="shared" para comida para compartir (pizzas, platos grandes, entradas para la mesa) y '
-    'kind="individual" para bebidas o platos individuales (cualquier bebida, cerveza, vino, refresco, '
-    "agua, jugo, coctel, o plato que normalmente pide y come una sola persona). "
-    "qty es la cantidad (numero entero) y unitPrice el precio unitario en pesos, sin simbolos ni "
-    "separadores de miles. Si el recibo muestra el precio total de la linea en vez del unitario, "
-    "calcula el unitario dividiendo el total entre la cantidad. "
-    "No incluyas como item las lineas de total, subtotal, impuestos, descuento, propina o cambio."
-)
-
-
-def extract_invoice_data(file_bytes, mime_type):
-    """Lee la factura con la IA de visión de OpenAI. Requiere OPENAI_API_KEY."""
-    import requests
-
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise MissingAPIKey()
-
-    model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-    b64 = base64.b64encode(file_bytes).decode()
-
-    if mime_type == "application/pdf":
-        # OpenAI (chat completions) lee imágenes, no PDF directamente. Convertimos
-        # la primera página del PDF a imagen. (Los PDF con texto real ya se leyeron antes.)
-        try:
-            import fitz  # PyMuPDF
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            pix = doc[0].get_pixmap(matrix=fitz.Matrix(2, 2))
-            b64 = base64.b64encode(pix.tobytes("png")).decode()
-            doc.close()
-            data_url = f"data:image/png;base64,{b64}"
-        except Exception as e:
-            raise ValueError(f"No se pudo convertir el PDF a imagen: {e}")
-    else:
-        data_url = f"data:{mime_type};base64,{b64}"
-
-    resp = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "max_tokens": 1800,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": INVOICE_PROMPT},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }],
-        },
-        timeout=60,
-    )
-    if resp.status_code == 401:
-        raise ValueError("La clave de OpenAI no es válida o fue revocada.")
-    resp.raise_for_status()
-    data = resp.json()
-    text = data["choices"][0]["message"]["content"]
-    return _extract_json_object(text)
-
-
-def guess_mime(file_storage):
-    mime = file_storage.mimetype
-    if mime in ("image/jpeg", "image/png", "image/webp", "image/gif", "application/pdf"):
-        return mime
-    guessed, _ = mimetypes.guess_type(file_storage.filename or "")
-    return guessed or mime
 
 
 # =============================================================
@@ -339,7 +105,6 @@ def build_pdf(state):
 
     c = compute(state)
     event = state.get("event", {}) or {}
-    name_of = {p.get("id"): (p.get("name") or "(sin nombre)") for p in state.get("people", [])}
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -356,6 +121,7 @@ def build_pdf(state):
         pdf.cell(0, 7, latin(meta), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
 
+    # Resumen
     pdf.set_text_color(23, 53, 44)
     pairs = [
         ("Bolsa de multas", f"{c['totalPoldinas']} poldinas = {money(c['pool'])}"),
@@ -372,6 +138,7 @@ def build_pdf(state):
         pdf.cell(0, 7, latin(v), new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
+    # Reparto por persona
     pdf.set_font("Helvetica", "B", 13)
     pdf.cell(0, 8, latin("Cada quien paga"), new_x="LMARGIN", new_y="NEXT")
     with pdf.table(text_align=("LEFT", "CENTER", "RIGHT", "RIGHT", "RIGHT", "RIGHT"),
@@ -390,36 +157,31 @@ def build_pdf(state):
                    money(c["excess"]), money(c["extrasTotal"]), money(c["grand"])])
     pdf.ln(3)
 
-    items = state.get("items", []) or []
-    if items:
+    shared = state.get("shared", []) or []
+    if shared:
         pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, latin("Factura"), new_x="LMARGIN", new_y="NEXT")
-        with pdf.table(text_align=("LEFT", "CENTER", "RIGHT", "RIGHT", "CENTER", "LEFT")) as table:
-            table.row(["Item", "Cant.", "Precio", "Subtotal", "Tipo", "Persona"])
-            for i in items:
-                kind = "Individual" if i.get("kind") == "individual" else "Comun"
-                person = name_of.get(i.get("personId"), "-") if i.get("kind") == "individual" else "-"
-                table.row([
-                    latin(i.get("desc")), str(inum(i.get("qty"))),
-                    money(num(i.get("unitPrice"))),
-                    money(num(i.get("qty")) * num(i.get("unitPrice"))),
-                    kind, latin(person),
-                ])
+        pdf.cell(0, 8, latin("Consumo comun"), new_x="LMARGIN", new_y="NEXT")
+        with pdf.table(text_align=("LEFT", "CENTER", "RIGHT", "RIGHT")) as table:
+            table.row(["Item", "Cant.", "Precio", "Subtotal"])
+            for i in shared:
+                table.row([latin(i.get("desc")), str(inum(i.get("qty"))),
+                           money(num(i.get("unitPrice"))),
+                           money(num(i.get("qty")) * num(i.get("unitPrice")))])
         pdf.ln(3)
 
-    fines = state.get("fines", []) or []
-    if fines:
+    extras = state.get("extras", []) or []
+    if extras:
+        name_of = {p.get("id"): (p.get("name") or "(sin nombre)") for p in state.get("people", [])}
         pdf.set_font("Helvetica", "B", 12)
-        pdf.cell(0, 8, latin("Poldinas registradas"), new_x="LMARGIN", new_y="NEXT")
-        with pdf.table(text_align=("LEFT", "LEFT", "LEFT", "LEFT", "LEFT")) as table:
-            table.row(["Persona", "Fecha", "Hora", "Motivo", "Descripcion"])
-            for f in sorted(fines, key=lambda x: (x.get("date", ""), x.get("time", ""))):
-                table.row([
-                    latin(name_of.get(f.get("personId"), "-")), latin(f.get("date", "")),
-                    latin(f.get("time", "")), latin(f.get("reason", "")), latin(f.get("note", "")),
-                ])
+        pdf.cell(0, 8, latin("Consumos individuales"), new_x="LMARGIN", new_y="NEXT")
+        with pdf.table(text_align=("LEFT", "LEFT", "RIGHT")) as table:
+            table.row(["Persona", "Concepto", "Monto"])
+            for e in extras:
+                table.row([latin(name_of.get(e.get("personId"), "(sin asignar)")),
+                           latin(e.get("desc")), money(num(e.get("amount")))])
 
-    return bytes(pdf.output())
+    out = pdf.output()
+    return bytes(out)
 
 
 # =============================================================
@@ -427,18 +189,18 @@ def build_pdf(state):
 # =============================================================
 def build_xlsx(state):
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill
+    from openpyxl.styles import Font, PatternFill, Alignment
 
     c = compute(state)
     event = state.get("event", {}) or {}
-    name_of = {p.get("id"): (p.get("name") or "(sin nombre)") for p in state.get("people", [])}
-    MONEY = "#,##0"
+    MONEY = '#,##0'
     head_font = Font(bold=True, color="FFFFFF")
     head_fill = PatternFill("solid", fgColor="17352C")
     bold = Font(bold=True)
 
     wb = Workbook()
 
+    # ---- Resumen ----
     ws = wb.active
     ws.title = "Resumen"
     rows = [
@@ -465,9 +227,11 @@ def build_xlsx(state):
     ws.column_dimensions["A"].width = 22
     ws.column_dimensions["B"].width = 22
 
+    # ---- Cada quien paga ----
     ws2 = wb.create_sheet("Cada quien paga")
-    ws2.append(["Persona", "Poldinas", "Multas", "Exceso", "Extras", "Total"])
-    for cell in ws2[1]:
+    headers = ["Persona", "Poldinas", "Multas", "Exceso", "Extras", "Total"]
+    ws2.append(headers)
+    for i, cell in enumerate(ws2[1], 1):
         cell.font = head_font
         cell.fill = head_fill
     for r in c["rows"]:
@@ -483,37 +247,38 @@ def build_xlsx(state):
     for col in ("B", "C", "D", "E", "F"):
         ws2.column_dimensions[col].width = 13
 
-    ws3 = wb.create_sheet("Factura")
-    ws3.append(["Item", "Cantidad", "Precio unit", "Subtotal", "Tipo", "Persona"])
+    # ---- Consumo comun ----
+    ws3 = wb.create_sheet("Consumo comun")
+    ws3.append(["Item", "Cantidad", "Precio unit", "Subtotal"])
     for cell in ws3[1]:
         cell.font = head_font
         cell.fill = head_fill
-    for i in (state.get("items", []) or []):
+    for i in (state.get("shared", []) or []):
         q, p = num(i.get("qty")), num(i.get("unitPrice"))
-        kind = "Individual" if i.get("kind") == "individual" else "Comun"
-        person = name_of.get(i.get("personId"), "") if i.get("kind") == "individual" else ""
-        ws3.append([i.get("desc", ""), inum(i.get("qty")), p, q * p, kind, person])
+        ws3.append([i.get("desc", ""), inum(i.get("qty")), p, q * p])
     for col in ("C", "D"):
         for cell in ws3[col]:
             if isinstance(cell.value, (int, float)):
                 cell.number_format = MONEY
     ws3.column_dimensions["A"].width = 26
-    for col in ("B", "C", "D", "E", "F"):
+    for col in ("B", "C", "D"):
         ws3.column_dimensions[col].width = 13
 
-    ws4 = wb.create_sheet("Poldinas")
-    ws4.append(["Persona", "Fecha", "Hora", "Motivo", "Descripcion"])
+    # ---- Extras ----
+    ws4 = wb.create_sheet("Extras")
+    ws4.append(["Persona", "Concepto", "Monto"])
     for cell in ws4[1]:
         cell.font = head_font
         cell.fill = head_fill
-    for f in (state.get("fines", []) or []):
-        ws4.append([name_of.get(f.get("personId"), ""), f.get("date", ""), f.get("time", ""),
-                    f.get("reason", ""), f.get("note", "")])
-    ws4.column_dimensions["A"].width = 20
-    ws4.column_dimensions["B"].width = 12
-    ws4.column_dimensions["C"].width = 10
-    ws4.column_dimensions["D"].width = 26
-    ws4.column_dimensions["E"].width = 34
+    name_of = {p.get("id"): (p.get("name") or "(sin nombre)") for p in state.get("people", [])}
+    for e in (state.get("extras", []) or []):
+        ws4.append([name_of.get(e.get("personId"), "(sin asignar)"), e.get("desc", ""), num(e.get("amount"))])
+    for cell in ws4["C"]:
+        if isinstance(cell.value, (int, float)):
+            cell.number_format = MONEY
+    ws4.column_dimensions["A"].width = 22
+    ws4.column_dimensions["B"].width = 26
+    ws4.column_dimensions["C"].width = 13
 
     buf = BytesIO()
     wb.save(buf)
@@ -541,77 +306,6 @@ def api_calc():
     return jsonify(compute(state))
 
 
-@app.route("/api/parse-invoice-text", methods=["POST"])
-def api_parse_text():
-    data = request.get_json(force=True, silent=True) or {}
-    text = data.get("text", "")
-    items = parse_invoice_text(text)
-    meta = detect_totals_and_meta(text)
-    return jsonify({"items": items, "meta": meta})
-
-
-@app.route("/api/extract-invoice", methods=["POST"])
-def api_extract_invoice():
-    f = request.files.get("file")
-    if not f:
-        return jsonify({"error": "no_file", "message": "No se recibió ningún archivo."}), 400
-
-    mime = guess_mime(f)
-    if mime not in ("image/jpeg", "image/png", "image/webp", "image/gif", "application/pdf"):
-        return jsonify({"error": "bad_type",
-                         "message": "Formato no soportado. Sube una imagen (jpg, png, webp) o un PDF."}), 200
-
-    raw = f.read()
-    if not raw:
-        return jsonify({"error": "empty", "message": "El archivo llegó vacío."}), 200
-
-    # PDF: primero intenta leer el texto real del archivo (gratis, sin IA).
-    # Solo funciona si el PDF trae texto de verdad, no si es una foto/escaneo.
-    if mime == "application/pdf":
-        try:
-            pdf_text = extract_pdf_text(raw)
-        except Exception:
-            pdf_text = ""
-        if pdf_text and len(pdf_text) >= 20:
-            items = parse_invoice_text(pdf_text)
-            if items:
-                meta = detect_totals_and_meta(pdf_text)
-                return jsonify({"items": items, "meta": meta})
-        # si no se encontró texto util, sigue abajo e intenta con la IA de visión
-
-    # Foto (o PDF escaneado sin texto real): leer con la IA de visión de OpenAI.
-    try:
-        parsed = extract_invoice_data(raw, mime)
-    except MissingAPIKey:
-        msg = ("La lectura de fotos necesita una OPENAI_API_KEY configurada en Vercel. "
-               "Mientras tanto, usa 'Pegar texto' o agrega los items a mano.")
-        return jsonify({"error": "no_api_key", "message": msg}), 200
-    except Exception as e:
-        print(f"[IA] error al leer factura: {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        return jsonify({"error": "extract_failed", "message": f"No se pudo leer la factura: {e}"}), 200
-
-    items = parsed.get("items", []) if isinstance(parsed, dict) else []
-    norm = []
-    for it in items:
-        desc = str(it.get("desc", "")).strip() or "Item"
-        kind_raw = str(it.get("kind", "")).lower()
-        kind = "individual" if kind_raw.startswith("ind") else ("shared" if kind_raw else guess_kind(desc))
-        norm.append({
-            "desc": desc,
-            "qty": max(1, inum(it.get("qty"), 1)),
-            "unitPrice": round(num(it.get("unitPrice"), 0)),
-            "kind": kind,
-        })
-    meta = {
-        "place": parsed.get("place") if isinstance(parsed, dict) else None,
-        "date": parsed.get("date") if isinstance(parsed, dict) else None,
-        "subtotal": parsed.get("subtotal") if isinstance(parsed, dict) else None,
-        "total": parsed.get("total") if isinstance(parsed, dict) else None,
-    }
-    return jsonify({"items": norm, "meta": meta})
-
-
 @app.route("/api/export/pdf", methods=["POST"])
 def api_pdf():
     state = request.get_json(force=True, silent=True) or {}
@@ -620,7 +314,7 @@ def api_pdf():
     except Exception as e:
         return jsonify({"error": f"No se pudo generar el PDF: {e}"}), 500
     return send_file(BytesIO(data), mimetype="application/pdf",
-                      as_attachment=True, download_name=filename(state, "pdf"))
+                     as_attachment=True, download_name=filename(state, "pdf"))
 
 
 @app.route("/api/export/xlsx", methods=["POST"])
@@ -680,9 +374,8 @@ PAGE = r"""<!DOCTYPE html>
   .card-h .sub{color:var(--ink-soft); font-size:12.5px;}
   .card-b{padding:16px 18px;}
   label{display:block; font-size:12px; font-weight:600; color:var(--ink-soft); margin:0 0 5px;}
-  input,select,textarea{width:100%; font-family:inherit; font-size:14px; color:var(--ink); background:#fff; border:1px solid var(--line); border-radius:9px; padding:9px 11px; outline:none;}
-  textarea{resize:vertical; min-height:60px; font-family:inherit;}
-  input:focus,select:focus,textarea:focus{border-color:var(--brass); box-shadow:0 0 0 3px var(--brass-soft);}
+  input,select{width:100%; font-family:inherit; font-size:14px; color:var(--ink); background:#fff; border:1px solid var(--line); border-radius:9px; padding:9px 11px; outline:none;}
+  input:focus,select:focus{border-color:var(--brass); box-shadow:0 0 0 3px var(--brass-soft);}
   input[type=number]{font-family:"JetBrains Mono",monospace;}
   .field-row{display:grid; gap:10px;}
   .cols-3{grid-template-columns:1.6fr 1fr auto;}
@@ -698,9 +391,10 @@ PAGE = r"""<!DOCTYPE html>
   .btn-x:hover{background:var(--brick-soft); color:var(--brick); border-color:var(--brick-soft);}
   .row{display:grid; gap:9px; align-items:center; padding:10px 0; border-top:1px dashed var(--line);}
   .row:first-child{border-top:none;}
-  .row-people2{grid-template-columns:1fr 110px auto;}
-  .row-item{grid-template-columns:1.3fr 60px 90px 100px 130px 90px auto;}
-  @media(max-width:760px){ .row-item{grid-template-columns:1fr 1fr;} .row-people2{grid-template-columns:1fr auto auto;} }
+  .row-people{grid-template-columns:1fr 130px auto;}
+  .row-shared{grid-template-columns:1fr 70px 1fr 90px auto;}
+  .row-extra{grid-template-columns:1fr 1fr 110px auto;}
+  @media(max-width:560px){ .row-people,.row-shared,.row-extra{grid-template-columns:1fr 1fr;} .row .span{grid-column:1/-1;} }
   .row .lineamt{font-family:"JetBrains Mono",monospace; font-size:13px; text-align:right; color:var(--ink-soft); align-self:center; white-space:nowrap;}
   .empty{color:var(--ink-soft); font-size:13.5px; text-align:center; padding:16px 8px; font-style:italic;}
   .meter-wrap{margin:6px 0 14px;}
@@ -731,7 +425,7 @@ PAGE = r"""<!DOCTYPE html>
   table.tbl td:first-child{text-align:left; font-family:"Inter",sans-serif; font-weight:500;}
   table.tbl tr.total-row td{border-top:2px solid var(--ink); border-bottom:none; font-weight:700; padding-top:11px;}
   table.tbl tr.total-row td:first-child{font-family:"Fraunces",serif;}
-  .pill{display:inline-block; font-size:10.5px; padding:1px 7px; border-radius:20px; font-weight:600; margin-left:6px; vertical-align:middle; white-space:nowrap;}
+  .pill{display:inline-block; font-size:10.5px; padding:1px 7px; border-radius:20px; font-weight:600; margin-left:6px; vertical-align:middle;}
   .pill.fined{background:var(--brass-soft); color:var(--brass-deep);}
   .pill.free{background:var(--pine-soft); color:var(--pine);}
   .grand{font-family:"Fraunces",serif; font-weight:700; color:var(--brass-deep);}
@@ -739,23 +433,10 @@ PAGE = r"""<!DOCTYPE html>
   .hist-item:first-child{border-top:none;}
   .hist-item .hname{flex:1; font-weight:500;}
   .hist-item .hdate{color:var(--ink-soft); font-size:11.5px; font-family:"JetBrains Mono",monospace;}
-  .toast{position:fixed; left:50%; bottom:26px; transform:translateX(-50%) translateY(20px); background:var(--ink); color:#fff; padding:11px 18px; border-radius:10px; font-size:13.5px; box-shadow:var(--shadow); opacity:0; transition:.25s; pointer-events:none; z-index:50; max-width:90vw; text-align:center;}
+  .toast{position:fixed; left:50%; bottom:26px; transform:translateX(-50%) translateY(20px); background:var(--ink); color:#fff; padding:11px 18px; border-radius:10px; font-size:13.5px; box-shadow:var(--shadow); opacity:0; transition:.25s; pointer-events:none; z-index:50;}
   .toast.show{opacity:1; transform:translateX(-50%) translateY(0);}
   .save-flag{font-size:11.5px; color:var(--ink-soft); margin-left:auto; display:flex; align-items:center; gap:6px;}
   .save-flag .d{width:7px;height:7px;border-radius:50%;background:var(--pine);}
-  .dropzone{display:block; border:1.5px dashed var(--line); border-radius:10px; padding:16px; text-align:center; color:var(--ink-soft); font-size:13px; cursor:pointer; background:var(--card-2);}
-  .dropzone:hover{border-color:var(--brass); color:var(--ink);}
-  .dropzone input{display:none;}
-  .divider{margin:12px 0; text-align:center; color:var(--ink-soft); font-size:11.5px; text-transform:uppercase; letter-spacing:.06em;}
-  .fine-row{padding:10px 0; border-top:1px dashed var(--line);}
-  .fine-row:first-child{border-top:none;}
-  .fine-top{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
-  .fine-name{font-weight:600;}
-  .fine-reason{background:var(--brass-soft); color:var(--brass-deep); font-size:11.5px; padding:2px 8px; border-radius:20px;}
-  .fine-date{font-family:"JetBrains Mono",monospace; font-size:11.5px; color:var(--ink-soft);}
-  .fine-row .btn-x{margin-left:auto;}
-  .fine-note{margin-top:4px; font-size:12.5px; color:var(--ink-soft); font-style:italic;}
-  .staging-note{margin-bottom:10px;}
 </style>
 </head>
 <body>
@@ -783,81 +464,45 @@ PAGE = r"""<!DOCTYPE html>
             <div style="width:130px"><label>Valor poldina</label><input id="evPV" type="number" min="0" step="100" value="1000"></div>
           </div>
           <div class="field-row" style="margin-top:10px; grid-template-columns:1fr; max-width:220px">
-            <div><label>Fecha del consumo</label><input id="evDate" type="date"></div>
+            <div><label>Fecha</label><input id="evDate" type="date"></div>
           </div>
         </div>
       </section>
 
       <section class="card">
-        <div class="card-h"><span class="n">02</span><h2>Personas</h2><span class="sub">La cantidad de poldinas se calcula sola</span></div>
+        <div class="card-h"><span class="n">02</span><h2>Personas</h2><span class="sub">Pon 0 poldinas a quien no tiene multa</span></div>
         <div class="card-b">
           <div id="peopleList"></div>
-          <div class="field-row" style="margin-top:14px; grid-template-columns:1fr auto; gap:10px">
+          <div class="field-row cols-3" style="margin-top:14px">
             <div><label>Nombre</label><input id="pName" placeholder="Nombre de la persona"></div>
-            <div style="display:flex; align-items:flex-end"><button class="btn-brass" id="btnAddPerson">Agregar</button></div>
+            <div><label>Poldinas</label><input id="pPold" type="number" min="0" step="1" value="0"></div>
+            <div style="display:flex; align-items:flex-end"><button class="btn-brass" id="btnAddPerson" style="width:100%">Agregar</button></div>
           </div>
         </div>
       </section>
 
       <section class="card">
-        <div class="card-h"><span class="n">03</span><h2>Registrar poldina</h2><span class="sub">Fecha, hora y motivo de la multa</span></div>
+        <div class="card-h"><span class="n">03</span><h2>Consumo comun (factura)</h2><span class="sub">Lo que cubren las multas</span></div>
         <div class="card-b">
-          <div id="finesList"></div>
-          <div class="field-row" style="margin-top:16px; grid-template-columns:1fr .8fr .7fr; gap:10px">
-            <div><label>Persona</label><select id="fPerson"></select></div>
-            <div><label>Fecha</label><input id="fDate" type="date"></div>
-            <div><label>Hora</label><input id="fTime" type="time"></div>
+          <div id="sharedList"></div>
+          <div class="field-row" style="margin-top:14px; grid-template-columns:1.4fr 1fr 1fr .8fr; gap:10px">
+            <div><label>Item</label><input id="sDesc" placeholder="Ej: Pizza mediana"></div>
+            <div><label>Cant.</label><input id="sQty" type="number" min="0" step="1" value="1"></div>
+            <div><label>Precio unit.</label><input id="sPrice" type="number" min="0" step="100" placeholder="1000"></div>
+            <div style="display:flex; align-items:flex-end"><button class="btn-brass" id="btnAddShared" style="width:100%">Agregar</button></div>
           </div>
-          <div class="field-row" style="margin-top:10px; grid-template-columns:1fr">
-            <div>
-              <label>Motivo</label>
-              <select id="fReason">
-                <option>Taza sucia o fuera de lugar</option>
-                <option>Luz encendida</option>
-                <option>Aire encendido</option>
-                <option>Dejó el carnet</option>
-                <option value="Otro">Otro</option>
-              </select>
-            </div>
-          </div>
-          <div class="field-row" id="fOtherWrap" style="display:none; margin-top:10px; grid-template-columns:1fr">
-            <div><label>Especifica el motivo</label><input id="fReasonOther" placeholder="Escribe el motivo"></div>
-          </div>
-          <div class="field-row" style="margin-top:10px; grid-template-columns:1fr">
-            <div><label>Descripción (opcional)</label><textarea id="fNote" placeholder="Detalles adicionales..."></textarea></div>
-          </div>
-          <button class="btn-brass" id="btnAddFine" style="margin-top:12px; width:100%">Registrar poldina</button>
         </div>
       </section>
 
       <section class="card">
-        <div class="card-h"><span class="n">04</span><h2>Factura</h2><span class="sub">Lo común se paga con multas, lo individual aparte</span></div>
+        <div class="card-h"><span class="n">04</span><h2>Consumos individuales</h2><span class="sub">Bebidas y extras - los paga cada quien</span></div>
         <div class="card-b">
-          <label class="dropzone" for="invoiceFile">
-            Sube una foto o PDF de la factura para leerla automáticamente
-            <input type="file" id="invoiceFile" accept="image/*,application/pdf">
-          </label>
-          <div style="font-size:11.5px; color:var(--ink-soft); margin-top:6px;">
-            Los PDF con texto real se leen gratis. Las fotos se leen con IA (requiere clave de OpenAI configurada). Para mejores resultados, toma la foto derecha y con buena luz.
-          </div>
-          <div class="divider">— o —</div>
-          <label>Pega el texto de la factura</label>
-          <textarea id="invoiceText" placeholder="Ej:&#10;2 Pizza mediana 24000&#10;Gaseosa 3000&#10;Cerveza 5000"></textarea>
-          <button class="btn-ghost btn-sm" id="btnParseText" style="margin-top:8px">Leer texto</button>
-
-          <div id="stagingBox" style="display:none; margin-top:16px;"></div>
-
-          <div style="margin:20px 0 8px; font-weight:600; font-size:13px; color:var(--ink-soft);">Items confirmados</div>
-          <div id="itemsList"></div>
-          <div class="field-row" style="margin-top:14px; grid-template-columns:1.3fr .6fr .9fr .9fr 1fr auto; gap:10px" id="addItemRow">
-            <div><label>Descripción</label><input id="iDesc" placeholder="Ej: Pizza mediana"></div>
-            <div><label>Cant.</label><input id="iQty" type="number" min="0" step="1" value="1"></div>
-            <div><label>Precio unit.</label><input id="iPrice" type="number" min="0" step="100" placeholder="1000"></div>
-            <div><label>Tipo</label>
-              <select id="iKind"><option value="shared">Común</option><option value="individual">Individual</option></select>
-            </div>
-            <div id="iPersonWrap" style="display:none"><label>Persona</label><select id="iPerson"></select></div>
-            <div style="display:flex; align-items:flex-end"><button class="btn-brass" id="btnAddItem" style="width:100%">Agregar</button></div>
+          <div id="extraList"></div>
+          <div class="field-row" style="margin-top:14px; grid-template-columns:1.2fr 1.4fr 1fr auto; gap:10px">
+            <div><label>Persona</label><select id="xPerson"></select></div>
+            <div><label>Concepto</label><input id="xDesc" placeholder="Ej: Gaseosa, cerveza"></div>
+            <div><label>Monto</label><input id="xAmt" type="number" min="0" step="100" placeholder="0"></div>
+            <div style="display:flex; align-items:flex-end"><button class="btn-brass" id="btnAddExtra" style="width:100%">Agregar</button></div>
           </div>
         </div>
       </section>
@@ -907,16 +552,14 @@ PAGE = r"""<!DOCTYPE html>
 
 <script>
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
-const CUR = new Intl.NumberFormat('es-DO',{style:'currency',currency:'DOP',maximumFractionDigits:0});
+const CUR = new Intl.NumberFormat('es-CO',{style:'currency',currency:'COP',maximumFractionDigits:0});
 const money = n => CUR.format(Math.round(n||0));
 
 const LS_CUR='poldinas:current', LS_EVENTS='poldinas:events';
 let state = loadCurrent() || blank();
-let staging = [];
 
-function blank(){ return {id:uid(), event:{name:'',place:'',date:'',poldinaValue:1000}, people:[], fines:[], items:[]}; }
-function loadCurrent(){ try{ const r=localStorage.getItem(LS_CUR); const s=r?JSON.parse(r):null;
-  if(s && !s.fines) s.fines=[]; if(s && !s.items) s.items=[]; return s; }catch(e){ return null; } }
+function blank(){ return {id:uid(), event:{name:'',place:'',date:'',poldinaValue:1000}, people:[], shared:[], extras:[]}; }
+function loadCurrent(){ try{ const r=localStorage.getItem(LS_CUR); return r?JSON.parse(r):null; }catch(e){ return null; } }
 function loadEvents(){ try{ const r=localStorage.getItem(LS_EVENTS); return r?JSON.parse(r):[]; }catch(e){ return []; } }
 
 let saveT=null;
@@ -935,24 +578,19 @@ async function doCalc(){
 }
 function jsCalc(){
   const pv=+state.event.poldinaValue||1000;
-  const finesByPerson={};
-  state.fines.forEach(f=>{ finesByPerson[f.personId]=(finesByPerson[f.personId]||0)+1; });
-  const totalPold=Object.values(finesByPerson).reduce((a,b)=>a+b,0);
+  const totalPold=state.people.reduce((s,p)=>s+(+p.poldinas||0),0);
   const pool=totalPold*pv;
-  const sharedItems=state.items.filter(i=>i.kind!=='individual');
-  const indivItems=state.items.filter(i=>i.kind==='individual');
-  const indivAssigned=indivItems.filter(i=>i.personId);
-  const indivUnassigned=indivItems.filter(i=>!i.personId);
-  const sharedCost=sharedItems.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
+  const sharedCost=state.shared.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
   const excess=Math.max(0,sharedCost-pool), surplus=Math.max(0,pool-sharedCost), covered=Math.min(sharedCost,pool);
-  const per = state.people.length ? excess/state.people.length : 0;
-  const rows=state.people.map(p=>{ const pold=finesByPerson[p.id]||0; const fine=pold*pv;
-    const ex=indivAssigned.filter(i=>i.personId===p.id).reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
-    const sh=excess>0 ? per : 0;
-    return {id:p.id,name:p.name||'(sin nombre)',poldinas:pold,fine,excessShare:sh,extras:ex,total:fine+ex+sh,fined:pold>0}; });
-  const extrasTotal=indivAssigned.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
-  const unassignedTotal=indivUnassigned.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
-  return {totalPoldinas:totalPold,pool,sharedCost,covered,excess,surplus,extrasTotal,unassignedTotal,unassignedCount:indivUnassigned.length,grand:rows.reduce((s,r)=>s+r.total,0),excessPer:per,rows};
+  const nonF=state.people.filter(p=>(+p.poldinas||0)===0);
+  let base=nonF, fallback=false; if(excess>0&&!nonF.length){ base=state.people; fallback=true; }
+  const per=base.length?excess/base.length:0; const ids=new Set(base.map(p=>p.id));
+  const rows=state.people.map(p=>{ const fine=(+p.poldinas||0)*pv;
+    const ex=state.extras.filter(e=>e.personId===p.id).reduce((s,e)=>s+(+e.amount||0),0);
+    const sh=(excess>0&&ids.has(p.id))?per:0;
+    return {id:p.id,name:p.name||'(sin nombre)',poldinas:+p.poldinas||0,fine,excessShare:sh,extras:ex,total:fine+ex+sh,fined:(+p.poldinas||0)>0}; });
+  const extrasTotal=state.extras.reduce((s,e)=>s+(+e.amount||0),0);
+  return {totalPoldinas:totalPold,pool,sharedCost,covered,excess,surplus,extrasTotal,grand:rows.reduce((s,r)=>s+r.total,0),excessPer:per,nonFinedCount:nonF.length,fallback,rows};
 }
 
 /* ---------- helpers DOM ---------- */
@@ -961,111 +599,43 @@ function el(tag, attrs={}, kids=[]){ const n=document.createElement(tag);
     else if(k.startsWith('on'))n.addEventListener(k.slice(2),attrs[k]); else n.setAttribute(k,attrs[k]); }
   (Array.isArray(kids)?kids:[kids]).forEach(c=>{ if(c!=null)n.append(c.nodeType?c:document.createTextNode(c)); });
   return n; }
-function fillOptions(sel, selected){ sel.innerHTML='';
-  if(!state.people.length){ sel.append(el('option',{value:''},'- agrega personas -')); return; }
-  state.people.forEach(p=>{ const o=el('option',{value:p.id}, p.name||'(sin nombre)'); if(p.id===selected)o.selected=true; sel.append(o); }); }
-function kindSelect(value, onChange){
-  const sel=document.createElement('select');
-  [['shared','Común'],['individual','Individual']].forEach(([v,label])=>{
-    const o=document.createElement('option'); o.value=v; o.textContent=label; if(v===value)o.selected=true; sel.appendChild(o);
-  });
-  sel.addEventListener('change', onChange);
-  return sel;
-}
-function nameOf(id){ return (state.people.find(p=>p.id===id)||{}).name || '(sin nombre)'; }
-function refreshPersonSelects(){
-  fillOptions(document.getElementById('fPerson'));
-  fillOptions(document.getElementById('iPerson'));
-  renderFines(); renderItems(); renderStaging();
-}
 
-/* ---------- personas ---------- */
+/* ---------- listas ---------- */
 function renderPeople(){ const box=document.getElementById('peopleList'); box.innerHTML='';
   if(!state.people.length){ box.append(el('div',{class:'empty'},'Aun no hay personas.')); return; }
   state.people.forEach(p=>{
-    const count=state.fines.filter(f=>f.personId===p.id).length;
-    const name=el('input',{value:p.name||'',placeholder:'Nombre',oninput:e=>{p.name=e.target.value; refreshPersonSelects(); renderPeople.keepFocus=true; scheduleCalc(); save();}});
-    const badge=el('span',{class: count?'pill fined':'pill free'}, count? (count+' poldina'+(count>1?'s':'')) : 'sin multa');
-    const del=el('button',{class:'btn-x',title:'Quitar',onclick:()=>{
-      state.people=state.people.filter(x=>x.id!==p.id);
-      state.fines=state.fines.filter(x=>x.personId!==p.id);
-      state.items=state.items.filter(x=>!(x.kind==='individual'&&x.personId===p.id));
-      renderPeople(); refreshPersonSelects(); scheduleCalc(); save();
-    }},'X');
-    box.append(el('div',{class:'row row-people2'},[name,badge,del]));
+    const name=el('input',{value:p.name||'',placeholder:'Nombre',class:'span',oninput:e=>{p.name=e.target.value; refreshExtraSelect(); scheduleCalc(); save();}});
+    const pold=el('input',{type:'number',min:'0',step:'1',value:p.poldinas??0,oninput:e=>{p.poldinas=+e.target.value||0; scheduleCalc(); save();}});
+    const del=el('button',{class:'btn-x',title:'Quitar',onclick:()=>{ state.people=state.people.filter(x=>x.id!==p.id); state.extras=state.extras.filter(x=>x.personId!==p.id); renderPeople(); renderExtras(); refreshExtraSelect(); scheduleCalc(); save(); }},'X');
+    box.append(el('div',{class:'row row-people'},[name,pold,del]));
   });
 }
-
-/* ---------- poldinas / multas ---------- */
-function renderFines(){ const box=document.getElementById('finesList'); box.innerHTML='';
-  if(!state.fines.length){ box.append(el('div',{class:'empty'},'Sin poldinas registradas.')); return; }
-  const sorted=[...state.fines].sort((a,b)=> (b.date+' '+b.time).localeCompare(a.date+' '+a.time));
-  sorted.forEach(f=>{
-    const del=el('button',{class:'btn-x',title:'Quitar',onclick:()=>{
-      state.fines=state.fines.filter(x=>x.id!==f.id); renderFines(); renderPeople(); scheduleCalc(); save();
-    }},'X');
-    const meta=(f.date||'')+' '+(f.time||'');
-    const top=el('div',{class:'fine-top'},[
-      el('span',{class:'fine-name'}, nameOf(f.personId)),
-      el('span',{class:'fine-reason'}, f.reason||''),
-      el('span',{class:'fine-date'}, meta.trim()),
-      del,
-    ]);
-    const wrap=el('div',{class:'fine-row'},[top]);
-    if(f.note) wrap.append(el('div',{class:'fine-note'}, f.note));
-    box.append(wrap);
-  });
-}
-
-/* ---------- factura: items confirmados ---------- */
-function renderItems(){ const box=document.getElementById('itemsList'); box.innerHTML='';
-  if(!state.items.length){ box.append(el('div',{class:'empty'},'Sin items en la factura todavia.')); return; }
-  state.items.forEach(it=>{
-    const desc=el('input',{value:it.desc||'',oninput:e=>{it.desc=e.target.value; save();}});
+function renderShared(){ const box=document.getElementById('sharedList'); box.innerHTML='';
+  if(!state.shared.length){ box.append(el('div',{class:'empty'},'Sin items de consumo comun.')); return; }
+  state.shared.forEach(it=>{
+    const amt=el('div',{class:'lineamt'}, money((+it.qty||0)*(+it.unitPrice||0)));
+    const upd=()=>{ amt.textContent=money((+it.qty||0)*(+it.unitPrice||0)); };
+    const desc=el('input',{value:it.desc||'',placeholder:'Item',class:'span',oninput:e=>{it.desc=e.target.value; save();}});
     const qty=el('input',{type:'number',min:'0',step:'1',value:it.qty??1,oninput:e=>{it.qty=+e.target.value||0; upd(); scheduleCalc(); save();}});
     const price=el('input',{type:'number',min:'0',step:'100',value:it.unitPrice??0,oninput:e=>{it.unitPrice=+e.target.value||0; upd(); scheduleCalc(); save();}});
-    const kSel=kindSelect(it.kind, e=>{ it.kind=e.target.value; if(it.kind==='shared') it.personId=null; renderItems(); scheduleCalc(); save(); });
-    const pSel=document.createElement('select'); fillOptions(pSel, it.personId);
-    pSel.style.display = it.kind==='individual' ? '' : 'none';
-    pSel.addEventListener('change', e=>{ it.personId=e.target.value; scheduleCalc(); save(); });
-    const amt=el('div',{class:'lineamt'}, money((+it.qty||0)*(+it.unitPrice||0)));
-    function upd(){ amt.textContent=money((+it.qty||0)*(+it.unitPrice||0)); }
-    const del=el('button',{class:'btn-x',title:'Quitar',onclick:()=>{ state.items=state.items.filter(x=>x.id!==it.id); renderItems(); scheduleCalc(); save(); }},'X');
-    box.append(el('div',{class:'row row-item'},[desc,qty,price,kSel,pSel,amt,del]));
+    const del=el('button',{class:'btn-x',title:'Quitar',onclick:()=>{ state.shared=state.shared.filter(x=>x.id!==it.id); renderShared(); scheduleCalc(); save(); }},'X');
+    box.append(el('div',{class:'row row-shared'},[desc,qty,price,amt,del]));
   });
 }
-
-/* ---------- factura: staging (pendiente de confirmar) ---------- */
-function renderStaging(){ const box=document.getElementById('stagingBox'); box.innerHTML='';
-  if(!staging.length){ box.style.display='none'; return; }
-  box.style.display='block';
-  box.append(el('div',{class:'note info staging-note'}, staging.length+' item(s) leidos de la factura. Revisa cantidad, precio y tipo antes de confirmar.'));
-  staging.forEach((it,idx)=>{
-    const desc=el('input',{value:it.desc||'',oninput:e=>{it.desc=e.target.value;}});
-    const qty=el('input',{type:'number',min:'0',step:'1',value:it.qty??1,oninput:e=>{it.qty=+e.target.value||0; upd();}});
-    const price=el('input',{type:'number',min:'0',step:'100',value:it.unitPrice??0,oninput:e=>{it.unitPrice=+e.target.value||0; upd();}});
-    const kSel=kindSelect(it.kind, e=>{ it.kind=e.target.value; renderStaging(); });
-    const pSel=document.createElement('select'); fillOptions(pSel, it.personId);
-    pSel.style.display = it.kind==='individual' ? '' : 'none';
-    pSel.addEventListener('change', e=>{ it.personId=e.target.value; });
-    const amt=el('div',{class:'lineamt'}, money((+it.qty||0)*(+it.unitPrice||0)));
-    function upd(){ amt.textContent=money((+it.qty||0)*(+it.unitPrice||0)); }
-    const del=el('button',{class:'btn-x',onclick:()=>{ staging.splice(idx,1); renderStaging(); }},'X');
-    box.append(el('div',{class:'row row-item'},[desc,qty,price,kSel,pSel,amt,del]));
+function renderExtras(){ const box=document.getElementById('extraList'); box.innerHTML='';
+  if(!state.extras.length){ box.append(el('div',{class:'empty'},'Sin consumos individuales.')); return; }
+  state.extras.forEach(x=>{
+    const sel=el('select',{onchange:e=>{x.personId=e.target.value; scheduleCalc(); save();}}); fillOptions(sel,x.personId);
+    const desc=el('input',{value:x.desc||'',placeholder:'Concepto',oninput:e=>{x.desc=e.target.value; save();}});
+    const amt=el('input',{type:'number',min:'0',step:'100',value:x.amount??0,oninput:e=>{x.amount=+e.target.value||0; scheduleCalc(); save();}});
+    const del=el('button',{class:'btn-x',title:'Quitar',onclick:()=>{ state.extras=state.extras.filter(v=>v.id!==x.id); renderExtras(); scheduleCalc(); save(); }},'X');
+    box.append(el('div',{class:'row row-extra'},[sel,desc,amt,del]));
   });
-  const confirmBtn=el('button',{class:'btn-primary',style:'margin-top:12px',onclick:confirmStaging},'Agregar todo a la factura');
-  const discardBtn=el('button',{class:'btn-ghost',style:'margin-top:12px; margin-left:8px',onclick:()=>{ staging=[]; renderStaging(); }},'Descartar');
-  box.append(confirmBtn, discardBtn);
 }
-function confirmStaging(){
-  staging.forEach(it=>{
-    state.items.push({id:uid(), desc:it.desc||'Item', qty:+it.qty||0, unitPrice:+it.unitPrice||0,
-      kind: it.kind==='individual'?'individual':'shared',
-      personId: it.kind==='individual' ? (it.personId||null) : null});
-  });
-  staging=[]; renderStaging(); renderItems(); scheduleCalc(); save();
-  toast('Items agregados a la factura');
-}
+function fillOptions(sel,selected){ sel.innerHTML='';
+  if(!state.people.length){ sel.append(el('option',{value:''},'- agrega personas -')); return; }
+  state.people.forEach(p=>{ const o=el('option',{value:p.id}, p.name||'(sin nombre)'); if(p.id===selected)o.selected=true; sel.append(o); }); }
+function refreshExtraSelect(){ const add=document.getElementById('xPerson'); fillOptions(add,add.value); renderExtras(); }
 
 /* ---------- resumen ---------- */
 function renderSummary(c){ renderMeter(c); renderStats(c); renderBreakdown(c); }
@@ -1083,9 +653,9 @@ function renderStats(c){
   document.getElementById('vExtras').textContent=money(c.extrasTotal);
   document.getElementById('vGrand').textContent=money(c.grand);
   const nb=document.getElementById('noteBox'); nb.innerHTML='';
-  if(c.excess>0) nb.append(el('div',{class:'note warn'},`El consumo se paso por ${money(c.excess)}. Se reparte entre las ${state.people.length} persona(s) -> ${money(c.excessPer)} c/u.`));
+  if(c.excess>0 && !c.fallback) nb.append(el('div',{class:'note warn'},`El consumo se paso por ${money(c.excess)}. Se reparte entre ${c.nonFinedCount} persona(s) sin multa -> ${money(c.excessPer)} c/u.`));
+  if(c.fallback) nb.append(el('div',{class:'note warn'},`Hay un exceso de ${money(c.excess)} pero nadie esta sin multa. Se repartio entre todas las personas (${money(c.excessPer)} c/u).`));
   if(c.surplus>0) nb.append(el('div',{class:'note info'},`Las multas superan el consumo comun por ${money(c.surplus)} (bolsa sin usar).`));
-  if(c.unassignedCount>0) nb.append(el('div',{class:'note warn'},`Hay ${money(c.unassignedTotal)} en ${c.unassignedCount} item(s) individuales sin asignar a nadie. Ve a "Factura" y elige quien lo consumio, o no se cobrara.`));
 }
 function renderBreakdown(c){ const box=document.getElementById('breakdown'); box.innerHTML='';
   if(!c.rows.length){ box.append(el('div',{class:'empty'},'Agrega personas para ver el reparto.')); return; }
@@ -1109,8 +679,8 @@ function renderHistory(){ const box=document.getElementById('histList'); box.inn
   const evs=loadEvents().sort((a,b)=>(b.savedAt||'').localeCompare(a.savedAt||''));
   if(!evs.length){ box.append(el('div',{class:'empty'},'Todavia no has guardado eventos.')); return; }
   evs.forEach(ev=>{
-    const d=ev.savedAt?new Date(ev.savedAt).toLocaleDateString('es-DO',{day:'2-digit',month:'short',year:'2-digit'}):'';
-    const load=el('button',{class:'btn-ghost btn-sm',onclick:()=>{ state=JSON.parse(JSON.stringify(ev.state)); if(!state.fines)state.fines=[]; if(!state.items)state.items=[]; syncInputs(); renderAll(); save(); toast('Evento cargado'); }},'Cargar');
+    const d=ev.savedAt?new Date(ev.savedAt).toLocaleDateString('es-CO',{day:'2-digit',month:'short',year:'2-digit'}):'';
+    const load=el('button',{class:'btn-ghost btn-sm',onclick:()=>{ state=JSON.parse(JSON.stringify(ev.state)); syncInputs(); renderAll(); save(); toast('Evento cargado'); }},'Cargar');
     const del=el('button',{class:'btn-x',title:'Eliminar',onclick:()=>{ const list=loadEvents().filter(e=>e.id!==ev.id); localStorage.setItem(LS_EVENTS,JSON.stringify(list)); renderHistory(); toast('Evento eliminado'); }},'X');
     box.append(el('div',{class:'hist-item'},[ el('span',{class:'hname'}, ev.name||'Evento'), el('span',{class:'hdate'}, d), load, del ]));
   });
@@ -1123,89 +693,7 @@ function syncInputs(){
   document.getElementById('evDate').value=state.event.date||'';
   document.getElementById('evPV').value=state.event.poldinaValue??1000;
 }
-function renderAll(){ renderPeople(); renderFines(); renderItems(); refreshPersonSelects(); scheduleCalc(); }
-
-function applyInvoiceMeta(meta){
-  if(!meta) return;
-  if(meta.place && !state.event.place){
-    state.event.place = meta.place; document.getElementById('evPlace').value = meta.place;
-  }
-  if(meta.date && !state.event.date){
-    state.event.date = meta.date; document.getElementById('evDate').value = meta.date;
-  }
-  if(!state.event.name && meta.place){
-    state.event.name = 'Consumo en ' + meta.place; document.getElementById('evName').value = state.event.name;
-  }
-  save();
-}
-function addTaxDifferenceIfNeeded(meta){
-  if(!meta || !meta.total) return;
-  const sumStaging = staging.reduce((s,it)=> s+(+it.qty||0)*(+it.unitPrice||0), 0);
-  const diff = Math.round((+meta.total||0) - sumStaging);
-  if(diff > 1){
-    staging.push({desc:'Cargos e impuestos (ITBIS/Ley/servicio)', qty:1, unitPrice:diff, kind:'shared', personId:null});
-    toast('Se detecto un total de '+money(meta.total)+'. Se agrego la diferencia ('+money(diff)+') como cargo comun.');
-  }
-}
-
-/* ---------- factura: subir archivo / pegar texto ---------- */
-function shrinkImage(file, maxSide){
-  return new Promise((resolve)=>{
-    if(!file.type || !file.type.startsWith('image/')) { resolve(file); return; }
-    const url=URL.createObjectURL(file);
-    const im=new Image();
-    im.onload=()=>{
-      let w=im.width, h=im.height;
-      const longest=Math.max(w,h);
-      if(longest>maxSide){ const s=maxSide/longest; w=Math.round(w*s); h=Math.round(h*s); }
-      const cv=document.createElement('canvas'); cv.width=w; cv.height=h;
-      cv.getContext('2d').drawImage(im, 0, 0, w, h);
-      URL.revokeObjectURL(url);
-      cv.toBlob(b=>{ resolve(b || file); }, 'image/jpeg', 0.85);
-    };
-    im.onerror=()=>{ URL.revokeObjectURL(url); resolve(file); };
-    im.src=url;
-  });
-}
-async function handleInvoiceFile(file){
-  toast('Preparando imagen...');
-  // Reducir la foto en el navegador antes de subirla: baja mucho la memoria
-  // que usa el servidor y ayuda a evitar el error 502 del plan gratis.
-  let toSend = file;
-  try{ toSend = await shrinkImage(file, 1600); }catch(_){ toSend = file; }
-  toast('Leyendo factura... (puede tardar hasta 1 min)');
-  const fd=new FormData(); fd.append('file', toSend, 'factura.jpg');
-  try{
-    const res=await fetch('/api/extract-invoice',{method:'POST', body:fd});
-    if(res.status===502 || res.status===503){
-      toast('El servidor se quedó sin memoria al leer la foto. Prueba con una foto más pequeña/liviana, o usa "Pegar texto".');
-      return;
-    }
-    let data;
-    try{ data=await res.json(); }
-    catch(_){ toast('El servidor no pudo procesar la foto (posible falta de memoria). Usa una foto más liviana o "Pegar texto".'); return; }
-    if(data.error==='no_api_key'){ toast(data.message||'Extraccion automatica no configurada.'); return; }
-    if(data.error){ toast(data.message||'No se pudo leer la factura.'); return; }
-    if(!data.items || !data.items.length){ toast('No se encontraron items en la factura. Prueba una foto más nítida o usa "Pegar texto".'); return; }
-    staging = data.items.map(it=>({...it, personId:null}));
-    addTaxDifferenceIfNeeded(data.meta);
-    applyInvoiceMeta(data.meta);
-    renderStaging(); toast(data.items.length+' item(s) leidos, revisalos abajo');
-  }catch(e){ toast('No se pudo leer la factura (revisa la conexion)'); }
-}
-async function handleInvoiceText(){
-  const text=document.getElementById('invoiceText').value.trim();
-  if(!text){ toast('Pega el texto de la factura primero'); return; }
-  try{
-    const res=await fetch('/api/parse-invoice-text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
-    const data=await res.json();
-    if(!data.items || !data.items.length){ toast('No se reconocieron lineas. Revisa el formato o agrega a mano.'); return; }
-    staging = data.items.map(it=>({...it, personId:null}));
-    addTaxDifferenceIfNeeded(data.meta);
-    applyInvoiceMeta(data.meta);
-    renderStaging(); toast(data.items.length+' linea(s) reconocidas, revisalas abajo');
-  }catch(e){ toast('No se pudo leer el texto'); }
-}
+function renderAll(){ renderPeople(); renderShared(); refreshExtraSelect(); scheduleCalc(); }
 
 /* ---------- exportar ---------- */
 async function download(url){
@@ -1219,9 +707,7 @@ async function download(url){
 }
 
 /* ---------- toast ---------- */
-let tT=null; function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(tT);
-  const dur = Math.min(9000, Math.max(2600, msg.length*70));
-  tT=setTimeout(()=>t.classList.remove('show'),dur); t.onclick=()=>{t.classList.remove('show'); clearTimeout(tT);}; }
+let tT=null; function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(tT); tT=setTimeout(()=>t.classList.remove('show'),2200); }
 
 /* ---------- bind ---------- */
 function bind(){ const on=(id,ev,fn)=>document.getElementById(id).addEventListener(ev,fn);
@@ -1229,47 +715,19 @@ function bind(){ const on=(id,ev,fn)=>document.getElementById(id).addEventListen
   on('evPlace','input',e=>{state.event.place=e.target.value; save();});
   on('evDate','input',e=>{state.event.date=e.target.value; save();});
   on('evPV','input',e=>{state.event.poldinaValue=+e.target.value||0; scheduleCalc(); save();});
-
   on('btnAddPerson','click',()=>{ const n=document.getElementById('pName').value.trim(); if(!n){toast('Escribe un nombre');return;}
-    state.people.push({id:uid(),name:n}); document.getElementById('pName').value='';
-    renderPeople(); refreshPersonSelects(); scheduleCalc(); save(); document.getElementById('pName').focus(); });
-
-  document.getElementById('fReason').addEventListener('change', e=>{
-    document.getElementById('fOtherWrap').style.display = e.target.value==='Otro' ? '' : 'none'; });
-
-  on('btnAddFine','click',()=>{
-    if(!state.people.length){ toast('Primero agrega personas'); return; }
-    const personId=document.getElementById('fPerson').value; if(!personId){ toast('Selecciona una persona'); return; }
-    const reasonSel=document.getElementById('fReason').value;
-    const reason = reasonSel==='Otro' ? (document.getElementById('fReasonOther').value.trim()||'Otro') : reasonSel;
-    const note=document.getElementById('fNote').value.trim();
-    state.fines.push({id:uid(), personId,
-      date: document.getElementById('fDate').value || new Date().toISOString().slice(0,10),
-      time: document.getElementById('fTime').value || '',
-      reason, note});
-    document.getElementById('fReasonOther').value=''; document.getElementById('fNote').value='';
-    renderFines(); renderPeople(); scheduleCalc(); save(); toast('Poldina registrada');
-  });
-
-  document.getElementById('iKind').addEventListener('change', e=>{
-    document.getElementById('iPersonWrap').style.display = e.target.value==='individual' ? '' : 'none'; });
-
-  on('btnAddItem','click',()=>{
-    const d=document.getElementById('iDesc').value.trim(); if(!d){toast('Escribe la descripcion');return;}
-    const kind=document.getElementById('iKind').value;
-    const personId = kind==='individual' ? document.getElementById('iPerson').value : null;
-    if(kind==='individual' && !personId){ toast('Selecciona quien lo consumio'); return; }
-    state.items.push({id:uid(), desc:d, qty:+document.getElementById('iQty').value||0,
-      unitPrice:+document.getElementById('iPrice').value||0, kind, personId});
-    document.getElementById('iDesc').value=''; document.getElementById('iQty').value=1; document.getElementById('iPrice').value='';
-    renderItems(); scheduleCalc(); save(); document.getElementById('iDesc').focus();
-  });
-
-  document.getElementById('invoiceFile').addEventListener('change', e=>{
-    const f=e.target.files[0]; if(f) handleInvoiceFile(f); e.target.value='';
-  });
-  on('btnParseText','click', handleInvoiceText);
-
+    state.people.push({id:uid(),name:n,poldinas:+document.getElementById('pPold').value||0});
+    document.getElementById('pName').value=''; document.getElementById('pPold').value=0;
+    renderPeople(); refreshExtraSelect(); scheduleCalc(); save(); document.getElementById('pName').focus(); });
+  on('btnAddShared','click',()=>{ const d=document.getElementById('sDesc').value.trim(); if(!d){toast('Escribe el item');return;}
+    state.shared.push({id:uid(),desc:d,qty:+document.getElementById('sQty').value||0,unitPrice:+document.getElementById('sPrice').value||0});
+    document.getElementById('sDesc').value=''; document.getElementById('sQty').value=1; document.getElementById('sPrice').value='';
+    renderShared(); scheduleCalc(); save(); document.getElementById('sDesc').focus(); });
+  on('btnAddExtra','click',()=>{ if(!state.people.length){toast('Primero agrega personas');return;}
+    const d=document.getElementById('xDesc').value.trim(); if(!d){toast('Escribe el concepto');return;}
+    state.extras.push({id:uid(),personId:document.getElementById('xPerson').value,desc:d,amount:+document.getElementById('xAmt').value||0});
+    document.getElementById('xDesc').value=''; document.getElementById('xAmt').value='';
+    renderExtras(); scheduleCalc(); save(); document.getElementById('xDesc').focus(); });
   on('btnSave','click',()=>{ const list=loadEvents(); const snap={id:state.id,name:state.event.name||'Evento sin nombre',savedAt:new Date().toISOString(),state:JSON.parse(JSON.stringify(state))};
     const i=list.findIndex(e=>e.id===state.id); if(i>=0)list[i]=snap; else list.push(snap);
     localStorage.setItem(LS_EVENTS,JSON.stringify(list)); renderHistory(); toast('Evento guardado'); });
@@ -1280,15 +738,9 @@ function bind(){ const on=(id,ev,fn)=>document.getElementById(id).addEventListen
 
 /* ---------- init ---------- */
 bind(); syncInputs(); renderAll(); renderHistory();
-(function setDefaultDateTime(){
-  const d=new Date();
-  document.getElementById('fDate').value = d.toISOString().slice(0,10);
-  document.getElementById('fTime').value = d.toTimeString().slice(0,5);
-})();
 </script>
 </body>
 </html>"""
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=True, port=5000)
