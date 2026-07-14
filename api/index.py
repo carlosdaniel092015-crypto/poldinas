@@ -81,17 +81,25 @@ def compute(state):
     surplus = max(0.0, pool - shared_cost)
     covered = min(shared_cost, pool)
 
-    excess_per = (excess / len(people)) if people else 0.0
+    # Una persona "asiste" salvo que se marque explícitamente attended=False.
+    def attended(p):
+        return p.get("attended", True) is not False
+
+    attendees = [p for p in people if attended(p)]
+    excess_per = (excess / len(attendees)) if attendees else 0.0
 
     rows = []
     for p in people:
         pold = fines_by_person.get(p.get("id"), 0)
         fine = pold * pv
+        went = attended(p)
+        # Los extras solo cuentan para quien asistió (los ausentes no consumieron).
         ex = sum(
             num(i.get("qty")) * num(i.get("unitPrice"))
             for i in indiv_assigned if i.get("personId") == p.get("id")
-        )
-        eshare = excess_per if excess > 0 else 0.0
+        ) if went else 0.0
+        # El exceso solo lo pagan los que asistieron.
+        eshare = excess_per if (excess > 0 and went) else 0.0
         rows.append({
             "id": p.get("id"),
             "name": p.get("name") or "(sin nombre)",
@@ -101,9 +109,15 @@ def compute(state):
             "extras": ex,
             "total": fine + eshare + ex,
             "fined": pold > 0,
+            "attended": went,
         })
 
-    extras_total = sum(num(i.get("qty")) * num(i.get("unitPrice")) for i in indiv_assigned)
+    # Solo suman al total los extras de quienes asistieron.
+    attendee_ids = {p.get("id") for p in attendees}
+    extras_total = sum(
+        num(i.get("qty")) * num(i.get("unitPrice"))
+        for i in indiv_assigned if i.get("personId") in attendee_ids
+    )
     unassigned_total = sum(num(i.get("qty")) * num(i.get("unitPrice")) for i in indiv_unassigned)
     grand = sum(r["total"] for r in rows)
 
@@ -118,6 +132,7 @@ def compute(state):
         "extrasTotal": extras_total,
         "unassignedTotal": unassigned_total,
         "unassignedCount": len(indiv_unassigned),
+        "attendeesCount": len(attendees),
         "grand": grand,
         "excessPer": excess_per,
         "rows": rows,
@@ -374,18 +389,19 @@ def build_pdf(state):
 
     pdf.set_font("Helvetica", "B", 13)
     pdf.cell(0, 8, latin("Cada quien paga"), new_x="LMARGIN", new_y="NEXT")
-    with pdf.table(text_align=("LEFT", "CENTER", "RIGHT", "RIGHT", "RIGHT", "RIGHT"),
-                   col_widths=(34, 16, 20, 18, 18, 22)) as table:
-        table.row(["Persona", "Pold.", "Multas", "Exceso", "Extras", "Total"])
+    with pdf.table(text_align=("LEFT", "CENTER", "CENTER", "RIGHT", "RIGHT", "RIGHT", "RIGHT"),
+                   col_widths=(30, 14, 16, 18, 16, 16, 20)) as table:
+        table.row(["Persona", "Pold.", "Asistio", "Multas", "Exceso", "Extras", "Total"])
         for r in c["rows"]:
             table.row([
                 latin(r["name"]), str(r["poldinas"]),
+                "Si" if r.get("attended", True) else "No",
                 money(r["fine"]),
                 money(r["excessShare"]) if r["excessShare"] else "-",
                 money(r["extras"]) if r["extras"] else "-",
                 money(r["total"]),
             ])
-        table.row(["TOTAL", "",
+        table.row(["TOTAL", "", "",
                    money(sum(r["fine"] for r in c["rows"])),
                    money(c["excess"]), money(c["extrasTotal"]), money(c["grand"])])
     pdf.ln(3)
@@ -466,21 +482,22 @@ def build_xlsx(state):
     ws.column_dimensions["B"].width = 22
 
     ws2 = wb.create_sheet("Cada quien paga")
-    ws2.append(["Persona", "Poldinas", "Multas", "Exceso", "Extras", "Total"])
+    ws2.append(["Persona", "Poldinas", "Asistio", "Multas", "Exceso", "Extras", "Total"])
     for cell in ws2[1]:
         cell.font = head_font
         cell.fill = head_fill
     for r in c["rows"]:
-        ws2.append([r["name"], r["poldinas"], r["fine"], r["excessShare"], r["extras"], r["total"]])
-    ws2.append(["TOTAL", "", sum(r["fine"] for r in c["rows"]), c["excess"], c["extrasTotal"], c["grand"]])
-    for col in ("C", "D", "E", "F"):
+        ws2.append([r["name"], r["poldinas"], "Si" if r.get("attended", True) else "No",
+                    r["fine"], r["excessShare"], r["extras"], r["total"]])
+    ws2.append(["TOTAL", "", "", sum(r["fine"] for r in c["rows"]), c["excess"], c["extrasTotal"], c["grand"]])
+    for col in ("D", "E", "F", "G"):
         for cell in ws2[col]:
             if isinstance(cell.value, (int, float)):
                 cell.number_format = MONEY
     for cell in ws2[ws2.max_row]:
         cell.font = bold
     ws2.column_dimensions["A"].width = 22
-    for col in ("B", "C", "D", "E", "F"):
+    for col in ("B", "C", "D", "E", "F", "G"):
         ws2.column_dimensions[col].width = 13
 
     ws3 = wb.create_sheet("Factura")
@@ -698,9 +715,12 @@ PAGE = r"""<!DOCTYPE html>
   .btn-x:hover{background:var(--brick-soft); color:var(--brick); border-color:var(--brick-soft);}
   .row{display:grid; gap:9px; align-items:center; padding:10px 0; border-top:1px dashed var(--line);}
   .row:first-child{border-top:none;}
-  .row-people2{grid-template-columns:1fr 110px auto;}
+  .row-people2{grid-template-columns:1fr 100px 96px auto;}
   .row-item{grid-template-columns:1.3fr 60px 90px 100px 130px 90px auto;}
-  @media(max-width:760px){ .row-item{grid-template-columns:1fr 1fr;} .row-people2{grid-template-columns:1fr auto auto;} }
+  @media(max-width:760px){ .row-item{grid-template-columns:1fr 1fr;} .row-people2{grid-template-columns:1fr auto auto auto;} }
+  .att-btn{padding:6px 8px; font-size:11.5px; border-radius:7px; border:1px solid var(--line); white-space:nowrap;}
+  .att-btn.on{background:var(--pine-soft); color:var(--pine); border-color:var(--pine-soft);}
+  .att-btn.off{background:var(--brick-soft); color:var(--brick); border-color:var(--brick-soft);}
   .row .lineamt{font-family:"JetBrains Mono",monospace; font-size:13px; text-align:right; color:var(--ink-soft); align-self:center; white-space:nowrap;}
   .empty{color:var(--ink-soft); font-size:13.5px; text-align:center; padding:16px 8px; font-style:italic;}
   .meter-wrap{margin:6px 0 14px;}
@@ -734,6 +754,7 @@ PAGE = r"""<!DOCTYPE html>
   .pill{display:inline-block; font-size:10.5px; padding:1px 7px; border-radius:20px; font-weight:600; margin-left:6px; vertical-align:middle; white-space:nowrap;}
   .pill.fined{background:var(--brass-soft); color:var(--brass-deep);}
   .pill.free{background:var(--pine-soft); color:var(--pine);}
+  .pill.ausente{background:var(--brick-soft); color:var(--brick);}
   .grand{font-family:"Fraunces",serif; font-weight:700; color:var(--brass-deep);}
   .hist-item{display:flex; align-items:center; gap:10px; padding:9px 0; border-top:1px dashed var(--line); font-size:13px;}
   .hist-item:first-child{border-top:none;}
@@ -789,12 +810,15 @@ PAGE = r"""<!DOCTYPE html>
       </section>
 
       <section class="card">
-        <div class="card-h"><span class="n">02</span><h2>Personas</h2><span class="sub">La cantidad de poldinas se calcula sola</span></div>
+        <div class="card-h"><span class="n">02</span><h2>Contactos</h2><span class="sub">Todos los del grupo. Marca quién asistió</span></div>
         <div class="card-b">
           <div id="peopleList"></div>
           <div class="field-row" style="margin-top:14px; grid-template-columns:1fr auto; gap:10px">
-            <div><label>Nombre</label><input id="pName" placeholder="Nombre de la persona"></div>
+            <div><label>Nombre</label><input id="pName" placeholder="Nombre del contacto"></div>
             <div style="display:flex; align-items:flex-end"><button class="btn-brass" id="btnAddPerson">Agregar</button></div>
+          </div>
+          <div style="font-size:11.5px; color:var(--ink-soft); margin-top:10px;">
+            Quien <b>no asistió</b> pero debe poldinas paga <b>solo sus multas</b> (no exceso ni extras). El exceso se reparte solo entre los que asistieron.
           </div>
         </div>
       </section>
@@ -945,14 +969,17 @@ function jsCalc(){
   const indivUnassigned=indivItems.filter(i=>!i.personId);
   const sharedCost=sharedItems.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
   const excess=Math.max(0,sharedCost-pool), surplus=Math.max(0,pool-sharedCost), covered=Math.min(sharedCost,pool);
-  const per = state.people.length ? excess/state.people.length : 0;
-  const rows=state.people.map(p=>{ const pold=finesByPerson[p.id]||0; const fine=pold*pv;
-    const ex=indivAssigned.filter(i=>i.personId===p.id).reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
-    const sh=excess>0 ? per : 0;
-    return {id:p.id,name:p.name||'(sin nombre)',poldinas:pold,fine,excessShare:sh,extras:ex,total:fine+ex+sh,fined:pold>0}; });
-  const extrasTotal=indivAssigned.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
+  const went = p => p.attended !== false;
+  const attendees = state.people.filter(went);
+  const per = attendees.length ? excess/attendees.length : 0;
+  const attIds = new Set(attendees.map(p=>p.id));
+  const rows=state.people.map(p=>{ const pold=finesByPerson[p.id]||0; const fine=pold*pv; const g=went(p);
+    const ex=g ? indivAssigned.filter(i=>i.personId===p.id).reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0) : 0;
+    const sh=(excess>0 && g) ? per : 0;
+    return {id:p.id,name:p.name||'(sin nombre)',poldinas:pold,fine,excessShare:sh,extras:ex,total:fine+ex+sh,fined:pold>0,attended:g}; });
+  const extrasTotal=indivAssigned.filter(i=>attIds.has(i.personId)).reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
   const unassignedTotal=indivUnassigned.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
-  return {totalPoldinas:totalPold,pool,sharedCost,covered,excess,surplus,extrasTotal,unassignedTotal,unassignedCount:indivUnassigned.length,grand:rows.reduce((s,r)=>s+r.total,0),excessPer:per,rows};
+  return {totalPoldinas:totalPold,pool,sharedCost,covered,excess,surplus,extrasTotal,unassignedTotal,unassignedCount:indivUnassigned.length,attendeesCount:attendees.length,grand:rows.reduce((s,r)=>s+r.total,0),excessPer:per,rows};
 }
 
 /* ---------- helpers DOM ---------- */
@@ -962,8 +989,9 @@ function el(tag, attrs={}, kids=[]){ const n=document.createElement(tag);
   (Array.isArray(kids)?kids:[kids]).forEach(c=>{ if(c!=null)n.append(c.nodeType?c:document.createTextNode(c)); });
   return n; }
 function fillOptions(sel, selected){ sel.innerHTML='';
-  if(!state.people.length){ sel.append(el('option',{value:''},'- agrega personas -')); return; }
-  state.people.forEach(p=>{ const o=el('option',{value:p.id}, p.name||'(sin nombre)'); if(p.id===selected)o.selected=true; sel.append(o); }); }
+  const asistieron=state.people.filter(p=>p.attended!==false);
+  if(!asistieron.length){ sel.append(el('option',{value:''},'- nadie asistió aún -')); return; }
+  asistieron.forEach(p=>{ const o=el('option',{value:p.id}, p.name||'(sin nombre)'); if(p.id===selected)o.selected=true; sel.append(o); }); }
 function kindSelect(value, onChange){
   const sel=document.createElement('select');
   [['shared','Común'],['individual','Individual']].forEach(([v,label])=>{
@@ -981,18 +1009,24 @@ function refreshPersonSelects(){
 
 /* ---------- personas ---------- */
 function renderPeople(){ const box=document.getElementById('peopleList'); box.innerHTML='';
-  if(!state.people.length){ box.append(el('div',{class:'empty'},'Aun no hay personas.')); return; }
+  if(!state.people.length){ box.append(el('div',{class:'empty'},'Aun no hay contactos.')); return; }
   state.people.forEach(p=>{
+    if(p.attended===undefined) p.attended=true;
     const count=state.fines.filter(f=>f.personId===p.id).length;
-    const name=el('input',{value:p.name||'',placeholder:'Nombre',oninput:e=>{p.name=e.target.value; refreshPersonSelects(); renderPeople.keepFocus=true; scheduleCalc(); save();}});
+    const name=el('input',{value:p.name||'',placeholder:'Nombre',oninput:e=>{p.name=e.target.value; refreshPersonSelects(); scheduleCalc(); save();}});
     const badge=el('span',{class: count?'pill fined':'pill free'}, count? (count+' poldina'+(count>1?'s':'')) : 'sin multa');
+    const att=el('button',{class: p.attended?'att-btn on':'att-btn off', title:'Cambiar asistencia', onclick:()=>{
+      p.attended=!p.attended;
+      if(!p.attended) state.items=state.items.filter(x=>!(x.kind==='individual'&&x.personId===p.id));
+      renderPeople(); refreshPersonSelects(); scheduleCalc(); save();
+    }}, p.attended?'Asistió':'No asistió');
     const del=el('button',{class:'btn-x',title:'Quitar',onclick:()=>{
       state.people=state.people.filter(x=>x.id!==p.id);
       state.fines=state.fines.filter(x=>x.personId!==p.id);
       state.items=state.items.filter(x=>!(x.kind==='individual'&&x.personId===p.id));
       renderPeople(); refreshPersonSelects(); scheduleCalc(); save();
     }},'X');
-    box.append(el('div',{class:'row row-people2'},[name,badge,del]));
+    box.append(el('div',{class:'row row-people2'},[name,badge,att,del]));
   });
 }
 
@@ -1083,7 +1117,7 @@ function renderStats(c){
   document.getElementById('vExtras').textContent=money(c.extrasTotal);
   document.getElementById('vGrand').textContent=money(c.grand);
   const nb=document.getElementById('noteBox'); nb.innerHTML='';
-  if(c.excess>0) nb.append(el('div',{class:'note warn'},`El consumo se paso por ${money(c.excess)}. Se reparte entre las ${state.people.length} persona(s) -> ${money(c.excessPer)} c/u.`));
+  if(c.excess>0) nb.append(el('div',{class:'note warn'},`El consumo se paso por ${money(c.excess)}. Se reparte entre los ${c.attendeesCount} que asistieron -> ${money(c.excessPer)} c/u.`));
   if(c.surplus>0) nb.append(el('div',{class:'note info'},`Las multas superan el consumo comun por ${money(c.surplus)} (bolsa sin usar).`));
   if(c.unassignedCount>0) nb.append(el('div',{class:'note warn'},`Hay ${money(c.unassignedTotal)} en ${c.unassignedCount} item(s) individuales sin asignar a nadie. Ve a "Factura" y elige quien lo consumio, o no se cobrara.`));
 }
@@ -1094,7 +1128,9 @@ function renderBreakdown(c){ const box=document.getElementById('breakdown'); box
   const tb=el('tbody');
   c.rows.forEach(r=>{
     const pill = r.fined ? el('span',{class:'pill fined'}, r.poldinas+'p') : el('span',{class:'pill free'},'sin multa');
-    tb.append(el('tr',{},[ el('td',{},[document.createTextNode(r.name),pill]),
+    const nameCell = el('td',{},[document.createTextNode(r.name),pill]);
+    if(r.attended===false) nameCell.append(el('span',{class:'pill ausente'},'no asistió'));
+    tb.append(el('tr',{},[ nameCell,
       el('td',{},money(r.fine)), el('td',{}, r.excessShare?money(r.excessShare):'-'),
       el('td',{}, r.extras?money(r.extras):'-'), el('td',{class:'grand'},money(r.total)) ]));
   });
