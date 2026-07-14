@@ -249,14 +249,25 @@ def _get_ocr_engine():
     global _OCR_ENGINE
     if _OCR_ENGINE is None:
         from rapidocr_onnxruntime import RapidOCR
-        _OCR_ENGINE = RapidOCR()
+        # Forzar 1 hilo por motor: en el plan gratis (512 MB) usar varios hilos
+        # dispara el uso de memoria y el proceso se cae (error 502).
+        _OCR_ENGINE = RapidOCR(
+            det_use_cuda=False, cls_use_cuda=False, rec_use_cuda=False,
+            intra_op_num_threads=1, inter_op_num_threads=1,
+        )
     return _OCR_ENGINE
+
+
+# Lado más largo máximo al que se reduce la imagen antes del OCR.
+# Más pequeño = menos memoria (clave en el plan gratis), pero menos detalle.
+OCR_MAX_SIDE = 1600
 
 
 def ocr_image_text(file_bytes):
     """Lee el texto de una foto usando un motor de OCR local (sin llamadas externas)."""
     from PIL import Image, ImageOps
     import numpy as np
+    import gc
 
     try:
         img = Image.open(BytesIO(file_bytes))
@@ -265,18 +276,28 @@ def ocr_image_text(file_bytes):
     except Exception as e:
         raise ValueError(f"No se pudo abrir la imagen: {e}")
 
+    # Redimensionar SIEMPRE a un lado máximo controlado: las fotos de celular
+    # suelen ser enormes (4000px+) y procesarlas agota la memoria del plan gratis.
     w, h = img.size
-    if max(w, h) < 1500:
-        scale = 1500 / max(w, h)
+    longest = max(w, h)
+    if longest > OCR_MAX_SIDE:
+        scale = OCR_MAX_SIDE / longest
         img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+    arr = np.array(img)
+    img.close()
+    del img
 
     try:
         engine = _get_ocr_engine()
-        result, _ = engine(np.array(img))
+        result, _ = engine(arr)
     except Exception as e:
         print(f"[OCR] fallo al usar RapidOCR: {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
         raise OCRNotAvailable(str(e))
+    finally:
+        del arr
+        gc.collect()
 
     if not result:
         return ""
@@ -292,7 +313,7 @@ def ocr_pdf_as_image(file_bytes):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     try:
         for page in doc:
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
             t = ocr_image_text(pix.tobytes("png"))
             if t:
                 texts.append(t)
@@ -1226,15 +1247,44 @@ function addTaxDifferenceIfNeeded(meta){
 }
 
 /* ---------- factura: subir archivo / pegar texto ---------- */
+function shrinkImage(file, maxSide){
+  return new Promise((resolve)=>{
+    if(!file.type || !file.type.startsWith('image/')) { resolve(file); return; }
+    const url=URL.createObjectURL(file);
+    const im=new Image();
+    im.onload=()=>{
+      let w=im.width, h=im.height;
+      const longest=Math.max(w,h);
+      if(longest>maxSide){ const s=maxSide/longest; w=Math.round(w*s); h=Math.round(h*s); }
+      const cv=document.createElement('canvas'); cv.width=w; cv.height=h;
+      cv.getContext('2d').drawImage(im, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      cv.toBlob(b=>{ resolve(b || file); }, 'image/jpeg', 0.85);
+    };
+    im.onerror=()=>{ URL.revokeObjectURL(url); resolve(file); };
+    im.src=url;
+  });
+}
 async function handleInvoiceFile(file){
-  toast('Leyendo factura...');
-  const fd=new FormData(); fd.append('file', file);
+  toast('Preparando imagen...');
+  // Reducir la foto en el navegador antes de subirla: baja mucho la memoria
+  // que usa el servidor y ayuda a evitar el error 502 del plan gratis.
+  let toSend = file;
+  try{ toSend = await shrinkImage(file, 1600); }catch(_){ toSend = file; }
+  toast('Leyendo factura... (puede tardar hasta 1 min)');
+  const fd=new FormData(); fd.append('file', toSend, 'factura.jpg');
   try{
     const res=await fetch('/api/extract-invoice',{method:'POST', body:fd});
-    const data=await res.json();
+    if(res.status===502 || res.status===503){
+      toast('El servidor se quedó sin memoria al leer la foto. Prueba con una foto más pequeña/liviana, o usa "Pegar texto".');
+      return;
+    }
+    let data;
+    try{ data=await res.json(); }
+    catch(_){ toast('El servidor no pudo procesar la foto (posible falta de memoria). Usa una foto más liviana o "Pegar texto".'); return; }
     if(data.error==='no_api_key'){ toast(data.message||'Extraccion automatica no configurada.'); return; }
     if(data.error){ toast(data.message||'No se pudo leer la factura.'); return; }
-    if(!data.items || !data.items.length){ toast('No se encontraron items en la factura.'); return; }
+    if(!data.items || !data.items.length){ toast('No se encontraron items en la factura. Prueba una foto más nítida o usa "Pegar texto".'); return; }
     staging = data.items.map(it=>({...it, personId:null}));
     addTaxDifferenceIfNeeded(data.meta);
     applyInvoiceMeta(data.meta);
