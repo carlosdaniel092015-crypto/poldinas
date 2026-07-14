@@ -1215,6 +1215,12 @@ function renderCharges(){ const box=document.getElementById('chargesList'); if(!
     box.append(el('div',{class:'row row-charge'},[desc,amt,del]));
   });
 }
+
+/* ---------- factura: staging (pendiente de confirmar) ---------- */
+function renderStaging(){ const box=document.getElementById('stagingBox'); box.innerHTML='';
+  if(!staging.length){ box.style.display='none'; return; }
+  box.style.display='block';
+  box.append(el('div',{class:'note info staging-note'}, staging.length+' item(s) leidos de la factura. Revisa cantidad, precio, tipo y a quién pertenece antes de confirmar.'));
   staging.forEach((it,idx)=>{
     const desc=el('input',{value:it.desc||'',oninput:e=>{it.desc=e.target.value;}});
     const qty=el('input',{type:'number',min:'0',step:'1',value:it.qty??1,oninput:e=>{it.qty=+e.target.value||0; upd();}});
