@@ -2,84 +2,78 @@
 
 App para repartir la cuenta cuando el equipo va a consumir las poldinas (multas). Los montos se muestran en pesos dominicanos (RD$).
 
+Esta versión está preparada para **Render.com**, que sí permite instalar las librerías necesarias para que la **lectura de fotos (OCR) funcione gratis**, sin necesitar ninguna API de pago.
+
 ## Qué hace
 
-- **Personas**: agregas a cada integrante. La cantidad de poldinas de cada uno se calcula sola, a partir de las multas que le registres (no la escribes a mano).
+- **Personas**: agregas a cada integrante. La cantidad de poldinas de cada uno se calcula sola, a partir de las multas que le registres.
 - **Registrar poldina**: cada multa queda guardada con persona, fecha, hora, motivo (Taza sucia o fuera de lugar, Luz encendida, Aire encendido, Dejó el carnet, u Otro) y una descripción libre opcional.
-- **Factura**:
-  - Puedes **subir una foto o PDF** de la factura y la app intenta leerla automáticamente, separando lo que es para compartir (pizzas, comida grande) de lo individual (bebidas, postres personales). *Esto requiere configurar una `ANTHROPIC_API_KEY` en Vercel — ver más abajo.*
-  - Sin esa configuración, puedes **pegar el texto de la factura** (copiado o escrito a mano) y un lector de texto (sin IA, gratis, siempre disponible) reconoce líneas como `2 Pizza mediana 24000` o `Gaseosa 3000`.
-  - Los items leídos quedan en una zona de revisión donde ajustas cantidad, precio, tipo (Común/Individual) y a quién asignar antes de confirmarlos.
-  - También puedes agregar items a mano en cualquier momento.
-- **Cálculo automático**: las multas cubren el consumo común. Si el consumo se pasa de lo que cubren las multas, el exceso se reparte por partes iguales entre quienes no tienen multa (o entre todos, si nadie está libre de multa). Los items individuales los paga cada quien.
-- **Aviso de items sin asignar**: si dejas una bebida sin decir quién la consumió, la app te avisa en vez de perderla del total.
-- **Exportar a PDF y Excel** con el resumen, el reparto por persona, la factura completa y el historial de multas.
-- **Guardado**: los datos quedan guardados solos en tu navegador. Puedes guardar distintos eventos y volver a cargarlos.
+- **Factura**: subes una **foto** o un **PDF** y la app la lee automáticamente (gratis), separando lo común (comida para compartir) de lo individual (bebidas). También puedes **pegar el texto** o agregar los items a mano. Los items leídos quedan en una zona de revisión donde ajustas cantidad, precio, tipo y a quién asignar antes de confirmarlos.
+- **Cálculo**: las multas cubren el consumo común. Si el consumo se pasa, la diferencia se divide entre TODAS las personas por igual. Los items individuales los paga cada quien. Detecta subtotal/total de la factura y agrega los impuestos como cargo común para que el total cuadre.
+- **Exportar a PDF y Excel** con el resumen, el reparto por persona, la factura y el historial de multas.
+- **Guardado** automático en el navegador, con historial de eventos.
 
 ---
 
 ## Estructura
 
 ```
-poldinas-app/
-├── api/
-│   └── index.py       # App Flask: interfaz + cálculo + lectura de factura + PDF + Excel
-├── requirements.txt   # Flask, fpdf2, openpyxl, requests
-├── vercel.json        # Enruta todo a la app Flask
+poldinas-render/
+├── app.py             # App Flask: interfaz + cálculo + lectura de factura (PDF/foto/texto) + PDF + Excel
+├── requirements.txt   # Dependencias de Python
+├── Dockerfile         # Instala las librerías de sistema que el OCR necesita
 └── README.md
 ```
 
 ---
 
-## Subir a Vercel
+## Subir a Render (paso a paso)
 
-### Desde GitHub (recomendada)
-1. Sube esta carpeta (`poldinas-app`) a un repositorio en GitHub.
-2. Entra a https://vercel.com → **Add New… → Project**.
-3. Importa el repositorio. Vercel detecta Python solo (lee `vercel.json` y `requirements.txt`).
-4. Clic en **Deploy**.
+### 1. Sube el proyecto a GitHub
+Sube esta carpeta (`poldinas-render`) a un repositorio en GitHub, igual que hiciste antes.
 
-### Con la CLI
-```bash
-npm i -g vercel
-cd poldinas-app
-vercel        # deploy de prueba
-vercel --prod # publicar
-```
+### 2. Crea el servicio en Render
+1. Entra a https://render.com y crea una cuenta (puedes entrar con tu cuenta de GitHub).
+2. Clic en **New +** → **Web Service**.
+3. Conecta tu repositorio de GitHub y selecciónalo.
+4. Render debería detectar el **Dockerfile** automáticamente. Verifica que:
+   - **Language / Runtime:** Docker
+   - **Plan:** Free
+5. Clic en **Create Web Service**.
+6. Render construye la imagen (esto tarda varios minutos la primera vez porque instala el OCR y sus modelos). Cuando termine, te da una URL tipo `poldinas.onrender.com`.
+
+Cada vez que subas cambios a GitHub, Render vuelve a desplegar solo.
 
 ---
 
-## Activar la lectura automática de facturas (opcional)
+## Cosas importantes que debes saber
 
-Sin configurar nada, la app funciona igual usando "Pegar texto" o agregando items a mano.
+- **El plan gratuito "se duerme":** si nadie usa la app por ~15 minutos, se apaga para ahorrar recursos. La siguiente vez que alguien entre, tarda entre 30 y 60 segundos en "despertar" (después va normal). Para un uso de equipo interno esto no suele ser problema.
+- **La lectura de fotos ahora es gratis y funciona**, pero el OCR es menos preciso con fotos torcidas, borrosas o con poca luz. Para el mejor resultado: toma la foto derecha, de cerca, con buena luz. Si lee algo mal, siempre puedes corregirlo en la pantalla de revisión antes de confirmar, o usar "Pegar texto".
+- **Siempre puedes revisar** lo que el OCR leyó antes de agregarlo: cantidad, precio, tipo (Común/Individual) y a quién se asigna cada bebida (eso el recibo no lo dice, lo pones tú).
 
-Si quieres que **suba una foto y la lea sola**, necesitas una API key de Anthropic:
+---
 
-1. Crea una cuenta en https://console.anthropic.com y genera una API key.
-2. En tu proyecto de Vercel: **Settings → Environment Variables**.
-3. Agrega una variable:
-   - **Name:** `ANTHROPIC_API_KEY`
+## (Opcional) IA como respaldo para fotos difíciles
+
+Si quieres máxima precisión con fotos complicadas, puedes activar además la lectura por IA (de pago). La app la usa automáticamente solo cuando el OCR gratis no logra leer nada útil.
+
+1. Crea una API key en https://console.anthropic.com.
+2. En Render: tu servicio → **Environment** → **Add Environment Variable**.
+   - **Key:** `ANTHROPIC_API_KEY`
    - **Value:** tu clave (empieza con `sk-ant-...`)
-4. Vuelve a desplegar el proyecto (Vercel → **Deployments → Redeploy**) para que tome la variable.
+3. Guarda; Render redepliega solo.
 
-Nota: esto usa la API de pago de Anthropic — cada foto leída tiene un costo pequeño según el uso. Si no configuras la key, la app simplemente muestra un aviso y sigue funcionando con el método de pegar texto o manual.
+Si no configuras esto, no pasa nada: el OCR gratis sigue siendo el que lee las fotos.
 
 ---
 
 ## Probar en tu computador (opcional)
 
 ```bash
-cd poldinas-app
+cd poldinas-render
 pip install -r requirements.txt
-python api/index.py
+python app.py
 # abre http://localhost:5000
 ```
-
----
-
-## Notas
-
-- **Guardado:** los eventos se guardan en el navegador (localStorage) del dispositivo donde los creas. No requiere base de datos.
-- **Compartir entre varios equipos/dispositivos:** si más adelante quieres que todos vean los mismos datos desde cualquier lugar, se puede conectar Vercel KV o Vercel Postgres. Avísame y lo agrego.
-- **Cálculo:** lo hace el servidor en Python (`/api/calc`); si el servidor no responde, la interfaz calcula igual como respaldo.
-- **Tamaño de archivo:** las fotos de factura muy pesadas pueden fallar por límites de tamaño en Vercel. Si pasa, prueba con una foto más liviana o usa "Pegar texto".
+(En tu computador, para que el OCR funcione necesitarías tener las librerías del sistema; en Render eso lo resuelve el Dockerfile automáticamente.)
