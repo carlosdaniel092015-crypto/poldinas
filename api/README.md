@@ -8,7 +8,8 @@ App para repartir la cuenta cuando el equipo va a consumir las poldinas (multas)
 - **Registrar poldina**: cada multa queda guardada con persona, fecha, hora, motivo (Taza sucia o fuera de lugar, Luz encendida, Aire encendido, Dejó el carnet, u Otro) y una descripción libre opcional.
 - **Factura**:
   - Si subes un **PDF con texto real** (no una foto guardada como PDF, sino uno generado digitalmente por el sistema de facturación), la app lo lee automáticamente **sin ningún costo ni configuración** — usa una librería de Python (`pdfplumber`) que extrae el texto que ya existe en el archivo, sin inteligencia artificial.
-  - Si subes una **foto** (o un PDF que en realidad es una imagen escaneada, sin texto real adentro), la app intenta leerla con IA. *Esto requiere configurar una `ANTHROPIC_API_KEY` en Vercel — ver más abajo.* Sin esa configuración, la app te avisa y puedes usar "Pegar texto" o agregar los items a mano.
+  - Si subes una **foto** (o un PDF que en realidad es una imagen escaneada), la app intenta leerla con un **OCR local** (`RapidOCR`) — también gratis y sin API key, corre dentro del mismo servidor de Python. Funciona mejor con fotos derechas, bien iluminadas y sin mucha inclinación; con fotos muy torcidas o borrosas puede no reconocer nada, y en ese caso te avisa.
+  - Si además configuras una `ANTHROPIC_API_KEY` (opcional, de pago), la app la usa como respaldo cuando el OCR local no reconoce nada útil — más precisa para fotos difíciles. *Ver más abajo cómo activarla.*
   - Sin ninguna configuración, siempre puedes **pegar el texto de la factura** (copiado o escrito a mano) y un lector de texto (sin IA, gratis, siempre disponible) reconoce líneas como `2 Pizza mediana 24000` o `Gaseosa 3000`.
   - Los items leídos quedan en una zona de revisión donde ajustas cantidad, precio, tipo (Común/Individual) y a quién asignar antes de confirmarlos.
   - También puedes agregar items a mano en cualquier momento.
@@ -49,6 +50,18 @@ vercel --prod # publicar
 ```
 
 ---
+
+## Si el OCR local (fotos) no funciona al desplegar
+
+La lectura de fotos usa una librería llamada `rapidocr-onnxruntime`, que se instala con `pip` sin necesitar ningún programa de sistema — a diferencia de Tesseract, que sí lo necesita y por eso no es compatible con Vercel. Aun así, no pude probar esta instalación en un despliegue real de Vercel antes de entregártela.
+
+Si al subir una foto te aparece el error *"El lector automático (OCR) no está disponible en este servidor todavía"*, probablemente algo falló al instalar `rapidocr-onnxruntime` o `PyMuPDF` durante el build de Vercel. En ese caso:
+
+1. Entra a tu proyecto en Vercel → **Deployments** → abre el despliegue más reciente → pestaña **Building** (o **Logs**).
+2. Busca si hay un error relacionado con `rapidocr`, `onnxruntime` o `fitz`/`PyMuPDF`.
+3. Cópiame el error exacto y lo ajustamos — puede ser simplemente que el nombre del paquete cambió de versión, o que se necesite un ajuste menor.
+
+Mientras tanto, "Pegar texto" y "Agregar a mano" siguen funcionando siempre, sin depender de esto.
 
 ## Activar la lectura automática de facturas (opcional)
 
