@@ -29,8 +29,8 @@ def inum(v, d=0):
 
 
 def money(n):
-    """Formato pesos dominicanos: RD$ 24,000"""
-    s = f"{int(round(n or 0)):,}"
+    """Formato pesos dominicanos con centavos: RD$ 24,000.00"""
+    s = f"{(n or 0):,.2f}"
     return f"RD$ {s}"
 
 
@@ -53,6 +53,22 @@ def guess_kind(desc):
     return "individual" if any(k in d for k in DRINK_KEYWORDS) else "shared"
 
 
+def item_person_ids(i):
+    """IDs de personas asignadas a un ítem individual. Acepta personIds (lista) o personId (viejo)."""
+    ids = i.get("personIds")
+    if isinstance(ids, list):
+        return [x for x in ids if x]
+    pid = i.get("personId")
+    return [pid] if pid else []
+
+
+def item_people_names(i, name_of):
+    ids = item_person_ids(i)
+    if not ids:
+        return "-"
+    return ", ".join(name_of.get(pid, "?") for pid in ids)
+
+
 # =============================================================
 #  Cálculo (fuente única de verdad)
 # =============================================================
@@ -73,25 +89,50 @@ def compute(state):
 
     shared_items = [i for i in items if i.get("kind") != "individual"]
     indiv_items = [i for i in items if i.get("kind") == "individual"]
-    indiv_assigned = [i for i in indiv_items if i.get("personId")]
-    indiv_unassigned = [i for i in indiv_items if not i.get("personId")]
 
-    shared_cost = sum(num(i.get("qty")) * num(i.get("unitPrice")) for i in shared_items)
+    indiv_assigned = [i for i in indiv_items if item_person_ids(i)]
+    indiv_unassigned = [i for i in indiv_items if not item_person_ids(i)]
+
+    # Cargos e impuestos (ITBIS, Ley 10%, servicio, etc.): son consumo común
+    # (los cubren las multas), pero se manejan aparte de los ítems de comida.
+    charges = state.get("charges", []) or []
+    charges_total = sum(num(ch.get("amount")) for ch in charges)
+
+    items_cost = sum(num(i.get("qty")) * num(i.get("unitPrice")) for i in shared_items)
+    shared_cost = items_cost + charges_total
     excess = max(0.0, shared_cost - pool)
     surplus = max(0.0, pool - shared_cost)
     covered = min(shared_cost, pool)
 
-    excess_per = (excess / len(people)) if people else 0.0
+    # Una persona "asiste" salvo que se marque explícitamente attended=False.
+    def attended(p):
+        return p.get("attended", True) is not False
+
+    attendees = [p for p in people if attended(p)]
+    attendee_ids = {p.get("id") for p in attendees}
+    excess_per = (excess / len(attendees)) if attendees else 0.0
+
+    # Cuánto le toca a cada persona de los ítems individuales.
+    # El costo de cada ítem se reparte por igual entre las personas asignadas
+    # que además asistieron. (Un ausente no consumió, así que no cuenta.)
+    extras_by_person = {}
+    for i in indiv_assigned:
+        line_total = num(i.get("qty")) * num(i.get("unitPrice"))
+        payers = [pid for pid in item_person_ids(i) if pid in attendee_ids]
+        if not payers:
+            continue
+        share = line_total / len(payers)
+        for pid in payers:
+            extras_by_person[pid] = extras_by_person.get(pid, 0.0) + share
 
     rows = []
     for p in people:
         pold = fines_by_person.get(p.get("id"), 0)
         fine = pold * pv
-        ex = sum(
-            num(i.get("qty")) * num(i.get("unitPrice"))
-            for i in indiv_assigned if i.get("personId") == p.get("id")
-        )
-        eshare = excess_per if excess > 0 else 0.0
+        went = attended(p)
+        ex = extras_by_person.get(p.get("id"), 0.0) if went else 0.0
+        # El exceso solo lo pagan los que asistieron.
+        eshare = excess_per if (excess > 0 and went) else 0.0
         rows.append({
             "id": p.get("id"),
             "name": p.get("name") or "(sin nombre)",
@@ -101,9 +142,11 @@ def compute(state):
             "extras": ex,
             "total": fine + eshare + ex,
             "fined": pold > 0,
+            "attended": went,
         })
 
-    extras_total = sum(num(i.get("qty")) * num(i.get("unitPrice")) for i in indiv_assigned)
+    # Solo suma al total lo que efectivamente se cobró a personas que asistieron.
+    extras_total = sum(extras_by_person.values())
     unassigned_total = sum(num(i.get("qty")) * num(i.get("unitPrice")) for i in indiv_unassigned)
     grand = sum(r["total"] for r in rows)
 
@@ -112,12 +155,15 @@ def compute(state):
         "totalPoldinas": total_pold,
         "pool": pool,
         "sharedCost": shared_cost,
+        "itemsCost": items_cost,
+        "chargesTotal": charges_total,
         "covered": covered,
         "excess": excess,
         "surplus": surplus,
         "extrasTotal": extras_total,
         "unassignedTotal": unassigned_total,
         "unassignedCount": len(indiv_unassigned),
+        "attendeesCount": len(attendees),
         "grand": grand,
         "excessPer": excess_per,
         "rows": rows,
@@ -173,7 +219,7 @@ def parse_invoice_text(text):
         items.append({
             "desc": desc,
             "qty": qty,
-            "unitPrice": round(unit_price),
+            "unitPrice": round(unit_price, 2),
             "kind": guess_kind(desc),
         })
     return items
@@ -188,6 +234,7 @@ def _to_number(s):
 
 def detect_totals_and_meta(text):
     meta = {}
+    charges = []
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     if lines:
         meta["place"] = lines[0][:80]
@@ -204,6 +251,14 @@ def detect_totals_and_meta(text):
             meta["subtotal"] = value
         elif low.startswith("total") and "total" not in meta:
             meta["total"] = value
+        elif "itbis" in low:
+            charges.append({"desc": "ITBIS", "amount": value})
+        elif low.startswith("ley") or "ley 10" in low:
+            charges.append({"desc": "Ley 10%", "amount": value})
+        elif "servicio" in low or "propina" in low:
+            charges.append({"desc": "Servicio/propina", "amount": value})
+    if charges:
+        meta["charges"] = charges
     dm = DATE_RE.search(text or "")
     if dm:
         d, mo, y = dm.groups()
@@ -360,6 +415,8 @@ def build_pdf(state):
     pairs = [
         ("Bolsa de multas", f"{c['totalPoldinas']} poldinas = {money(c['pool'])}"),
         ("Consumo comun", money(c["sharedCost"])),
+        ("  - Comida/items", money(c.get("itemsCost", 0))),
+        ("  - Impuestos y cargos", money(c.get("chargesTotal", 0))),
         ("Exceso repartido", money(c["excess"])),
         ("Multas sin usar", money(c["surplus"])),
         ("Extras individuales", money(c["extrasTotal"])),
@@ -374,18 +431,19 @@ def build_pdf(state):
 
     pdf.set_font("Helvetica", "B", 13)
     pdf.cell(0, 8, latin("Cada quien paga"), new_x="LMARGIN", new_y="NEXT")
-    with pdf.table(text_align=("LEFT", "CENTER", "RIGHT", "RIGHT", "RIGHT", "RIGHT"),
-                   col_widths=(34, 16, 20, 18, 18, 22)) as table:
-        table.row(["Persona", "Pold.", "Multas", "Exceso", "Extras", "Total"])
+    with pdf.table(text_align=("LEFT", "CENTER", "CENTER", "RIGHT", "RIGHT", "RIGHT", "RIGHT"),
+                   col_widths=(30, 14, 16, 18, 16, 16, 20)) as table:
+        table.row(["Persona", "Pold.", "Asistio", "Multas", "Exceso", "Extras", "Total"])
         for r in c["rows"]:
             table.row([
                 latin(r["name"]), str(r["poldinas"]),
+                "Si" if r.get("attended", True) else "No",
                 money(r["fine"]),
                 money(r["excessShare"]) if r["excessShare"] else "-",
                 money(r["extras"]) if r["extras"] else "-",
                 money(r["total"]),
             ])
-        table.row(["TOTAL", "",
+        table.row(["TOTAL", "", "",
                    money(sum(r["fine"] for r in c["rows"])),
                    money(c["excess"]), money(c["extrasTotal"]), money(c["grand"])])
     pdf.ln(3)
@@ -398,13 +456,24 @@ def build_pdf(state):
             table.row(["Item", "Cant.", "Precio", "Subtotal", "Tipo", "Persona"])
             for i in items:
                 kind = "Individual" if i.get("kind") == "individual" else "Comun"
-                person = name_of.get(i.get("personId"), "-") if i.get("kind") == "individual" else "-"
+                person = item_people_names(i, name_of) if i.get("kind") == "individual" else "-"
                 table.row([
                     latin(i.get("desc")), str(inum(i.get("qty"))),
                     money(num(i.get("unitPrice"))),
                     money(num(i.get("qty")) * num(i.get("unitPrice"))),
                     kind, latin(person),
                 ])
+        pdf.ln(3)
+
+    charges = state.get("charges", []) or []
+    if charges:
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, latin("Impuestos y cargos"), new_x="LMARGIN", new_y="NEXT")
+        with pdf.table(text_align=("LEFT", "RIGHT")) as table:
+            table.row(["Concepto", "Monto"])
+            for ch in charges:
+                table.row([latin(ch.get("desc", "")), money(num(ch.get("amount")))])
+            table.row(["TOTAL", money(c.get("chargesTotal", 0))])
         pdf.ln(3)
 
     fines = state.get("fines", []) or []
@@ -432,7 +501,7 @@ def build_xlsx(state):
     c = compute(state)
     event = state.get("event", {}) or {}
     name_of = {p.get("id"): (p.get("name") or "(sin nombre)") for p in state.get("people", [])}
-    MONEY = "#,##0"
+    MONEY = "#,##0.00"
     head_font = Font(bold=True, color="FFFFFF")
     head_fill = PatternFill("solid", fgColor="17352C")
     bold = Font(bold=True)
@@ -450,6 +519,8 @@ def build_xlsx(state):
         ("Total poldinas", c["totalPoldinas"]),
         ("Bolsa de multas", c["pool"]),
         ("Consumo comun", c["sharedCost"]),
+        ("  - Comida/items", c.get("itemsCost", 0)),
+        ("  - Impuestos y cargos", c.get("chargesTotal", 0)),
         ("Exceso repartido", c["excess"]),
         ("Multas sin usar", c["surplus"]),
         ("Extras individuales", c["extrasTotal"]),
@@ -460,27 +531,29 @@ def build_xlsx(state):
     for cell in ws["B"]:
         if isinstance(cell.value, (int, float)):
             cell.number_format = MONEY
-    ws["A12"].font = bold
-    ws["B12"].font = bold
-    ws.column_dimensions["A"].width = 22
+    last = ws.max_row  # fila del TOTAL a recaudar
+    ws.cell(row=last, column=1).font = bold
+    ws.cell(row=last, column=2).font = bold
+    ws.column_dimensions["A"].width = 24
     ws.column_dimensions["B"].width = 22
 
     ws2 = wb.create_sheet("Cada quien paga")
-    ws2.append(["Persona", "Poldinas", "Multas", "Exceso", "Extras", "Total"])
+    ws2.append(["Persona", "Poldinas", "Asistio", "Multas", "Exceso", "Extras", "Total"])
     for cell in ws2[1]:
         cell.font = head_font
         cell.fill = head_fill
     for r in c["rows"]:
-        ws2.append([r["name"], r["poldinas"], r["fine"], r["excessShare"], r["extras"], r["total"]])
-    ws2.append(["TOTAL", "", sum(r["fine"] for r in c["rows"]), c["excess"], c["extrasTotal"], c["grand"]])
-    for col in ("C", "D", "E", "F"):
+        ws2.append([r["name"], r["poldinas"], "Si" if r.get("attended", True) else "No",
+                    r["fine"], r["excessShare"], r["extras"], r["total"]])
+    ws2.append(["TOTAL", "", "", sum(r["fine"] for r in c["rows"]), c["excess"], c["extrasTotal"], c["grand"]])
+    for col in ("D", "E", "F", "G"):
         for cell in ws2[col]:
             if isinstance(cell.value, (int, float)):
                 cell.number_format = MONEY
     for cell in ws2[ws2.max_row]:
         cell.font = bold
     ws2.column_dimensions["A"].width = 22
-    for col in ("B", "C", "D", "E", "F"):
+    for col in ("B", "C", "D", "E", "F", "G"):
         ws2.column_dimensions[col].width = 13
 
     ws3 = wb.create_sheet("Factura")
@@ -491,15 +564,34 @@ def build_xlsx(state):
     for i in (state.get("items", []) or []):
         q, p = num(i.get("qty")), num(i.get("unitPrice"))
         kind = "Individual" if i.get("kind") == "individual" else "Comun"
-        person = name_of.get(i.get("personId"), "") if i.get("kind") == "individual" else ""
+        person = item_people_names(i, name_of) if i.get("kind") == "individual" else ""
+        if person == "-":
+            person = ""
         ws3.append([i.get("desc", ""), inum(i.get("qty")), p, q * p, kind, person])
     for col in ("C", "D"):
         for cell in ws3[col]:
             if isinstance(cell.value, (int, float)):
                 cell.number_format = MONEY
     ws3.column_dimensions["A"].width = 26
-    for col in ("B", "C", "D", "E", "F"):
+    for col in ("B", "C", "D", "E"):
         ws3.column_dimensions[col].width = 13
+    ws3.column_dimensions["F"].width = 28
+
+    wsc = wb.create_sheet("Impuestos y cargos")
+    wsc.append(["Concepto", "Monto"])
+    for cell in wsc[1]:
+        cell.font = head_font
+        cell.fill = head_fill
+    for ch in (state.get("charges", []) or []):
+        wsc.append([ch.get("desc", ""), num(ch.get("amount"))])
+    wsc.append(["TOTAL", c.get("chargesTotal", 0)])
+    for cell in wsc["B"]:
+        if isinstance(cell.value, (int, float)):
+            cell.number_format = MONEY
+    for cell in wsc[wsc.max_row]:
+        cell.font = bold
+    wsc.column_dimensions["A"].width = 32
+    wsc.column_dimensions["B"].width = 14
 
     ws4 = wb.create_sheet("Poldinas")
     ws4.append(["Persona", "Fecha", "Hora", "Motivo", "Descripcion"])
@@ -600,7 +692,7 @@ def api_extract_invoice():
         norm.append({
             "desc": desc,
             "qty": max(1, inum(it.get("qty"), 1)),
-            "unitPrice": round(num(it.get("unitPrice"), 0)),
+            "unitPrice": round(num(it.get("unitPrice"), 0), 2),
             "kind": kind,
         })
     meta = {
@@ -698,9 +790,23 @@ PAGE = r"""<!DOCTYPE html>
   .btn-x:hover{background:var(--brick-soft); color:var(--brick); border-color:var(--brick-soft);}
   .row{display:grid; gap:9px; align-items:center; padding:10px 0; border-top:1px dashed var(--line);}
   .row:first-child{border-top:none;}
-  .row-people2{grid-template-columns:1fr 110px auto;}
-  .row-item{grid-template-columns:1.3fr 60px 90px 100px 130px 90px auto;}
-  @media(max-width:760px){ .row-item{grid-template-columns:1fr 1fr;} .row-people2{grid-template-columns:1fr auto auto;} }
+  .row-people2{grid-template-columns:1fr 100px 96px auto;}
+  .row-item{grid-template-columns:1.4fr 60px 100px 110px 100px auto;}
+  .row-charge{grid-template-columns:1.6fr 130px auto;}
+  @media(max-width:760px){ .row-item{grid-template-columns:1fr 1fr;} .row-people2{grid-template-columns:1fr auto auto auto;} }
+  .att-btn{padding:6px 8px; font-size:11.5px; border-radius:7px; border:1px solid var(--line); white-space:nowrap;}
+  .att-btn.on{background:var(--pine-soft); color:var(--pine); border-color:var(--pine-soft);}
+  .att-btn.off{background:var(--brick-soft); color:var(--brick); border-color:var(--brick-soft);}
+  .item-wrap{padding:10px 0; border-top:1px dashed var(--line);}
+  .item-wrap:first-child{border-top:none;}
+  .item-wrap .row-item{padding:0; border-top:none;}
+  .chips-row{margin-top:8px; padding-left:2px;}
+  .chips{display:flex; flex-wrap:wrap; gap:6px;}
+  .chip{background:#fff; border:1px solid var(--line); color:var(--ink-soft); border-radius:20px; padding:4px 12px; font-size:12px; font-weight:500;}
+  .chip.on{background:var(--brass); color:#fff; border-color:var(--brass);}
+  .chip:hover{border-color:var(--brass);}
+  .chips-empty{font-size:12px; color:var(--brick); font-style:italic;}
+  .chips-hint{font-size:11px; color:var(--ink-soft); margin-top:5px;}
   .row .lineamt{font-family:"JetBrains Mono",monospace; font-size:13px; text-align:right; color:var(--ink-soft); align-self:center; white-space:nowrap;}
   .empty{color:var(--ink-soft); font-size:13.5px; text-align:center; padding:16px 8px; font-style:italic;}
   .meter-wrap{margin:6px 0 14px;}
@@ -734,6 +840,7 @@ PAGE = r"""<!DOCTYPE html>
   .pill{display:inline-block; font-size:10.5px; padding:1px 7px; border-radius:20px; font-weight:600; margin-left:6px; vertical-align:middle; white-space:nowrap;}
   .pill.fined{background:var(--brass-soft); color:var(--brass-deep);}
   .pill.free{background:var(--pine-soft); color:var(--pine);}
+  .pill.ausente{background:var(--brick-soft); color:var(--brick);}
   .grand{font-family:"Fraunces",serif; font-weight:700; color:var(--brass-deep);}
   .hist-item{display:flex; align-items:center; gap:10px; padding:9px 0; border-top:1px dashed var(--line); font-size:13px;}
   .hist-item:first-child{border-top:none;}
@@ -789,12 +896,15 @@ PAGE = r"""<!DOCTYPE html>
       </section>
 
       <section class="card">
-        <div class="card-h"><span class="n">02</span><h2>Personas</h2><span class="sub">La cantidad de poldinas se calcula sola</span></div>
+        <div class="card-h"><span class="n">02</span><h2>Contactos</h2><span class="sub">Todos los del grupo. Marca quién asistió</span></div>
         <div class="card-b">
           <div id="peopleList"></div>
           <div class="field-row" style="margin-top:14px; grid-template-columns:1fr auto; gap:10px">
-            <div><label>Nombre</label><input id="pName" placeholder="Nombre de la persona"></div>
+            <div><label>Nombre</label><input id="pName" placeholder="Nombre del contacto"></div>
             <div style="display:flex; align-items:flex-end"><button class="btn-brass" id="btnAddPerson">Agregar</button></div>
+          </div>
+          <div style="font-size:11.5px; color:var(--ink-soft); margin-top:10px;">
+            Quien <b>no asistió</b> pero debe poldinas paga <b>solo sus multas</b> (no exceso ni extras). El exceso se reparte solo entre los que asistieron.
           </div>
         </div>
       </section>
@@ -849,15 +959,23 @@ PAGE = r"""<!DOCTYPE html>
 
           <div style="margin:20px 0 8px; font-weight:600; font-size:13px; color:var(--ink-soft);">Items confirmados</div>
           <div id="itemsList"></div>
-          <div class="field-row" style="margin-top:14px; grid-template-columns:1.3fr .6fr .9fr .9fr 1fr auto; gap:10px" id="addItemRow">
+          <div class="field-row" style="margin-top:14px; grid-template-columns:1.6fr .6fr .9fr .9fr auto; gap:10px" id="addItemRow">
             <div><label>Descripción</label><input id="iDesc" placeholder="Ej: Pizza mediana"></div>
             <div><label>Cant.</label><input id="iQty" type="number" min="0" step="1" value="1"></div>
-            <div><label>Precio unit.</label><input id="iPrice" type="number" min="0" step="100" placeholder="1000"></div>
+            <div><label>Precio unit.</label><input id="iPrice" type="number" min="0" step="0.01" placeholder="1000"></div>
             <div><label>Tipo</label>
               <select id="iKind"><option value="shared">Común</option><option value="individual">Individual</option></select>
             </div>
-            <div id="iPersonWrap" style="display:none"><label>Persona</label><select id="iPerson"></select></div>
             <div style="display:flex; align-items:flex-end"><button class="btn-brass" id="btnAddItem" style="width:100%">Agregar</button></div>
+          </div>
+
+          <div style="margin:22px 0 4px; font-weight:600; font-size:13px; color:var(--ink-soft);">Impuestos y cargos</div>
+          <div style="font-size:11.5px; color:var(--ink-soft); margin-bottom:10px;">Se suman al consumo común (los cubren las multas). Se llenan solos al leer la factura.</div>
+          <div id="chargesList"></div>
+          <div class="field-row" style="margin-top:12px; grid-template-columns:1.6fr .9fr auto; gap:10px">
+            <div><label>Concepto</label><input id="chDesc" placeholder="Ej: ITBIS 18%, Ley 10%, Servicio"></div>
+            <div><label>Monto</label><input id="chAmt" type="number" min="0" step="0.01" placeholder="0"></div>
+            <div style="display:flex; align-items:flex-end"><button class="btn-ghost" id="btnAddCharge" style="width:100%">Agregar</button></div>
           </div>
         </div>
       </section>
@@ -883,6 +1001,7 @@ PAGE = r"""<!DOCTYPE html>
           </div>
           <div class="stat-line"><span class="k">Bolsa de multas <span id="poldCount" class="mono"></span></span><span class="v" id="vPool">$0</span></div>
           <div class="stat-line"><span class="k">Consumo comun</span><span class="v" id="vShared">$0</span></div>
+          <div class="stat-line" id="rowCharges" style="display:none"><span class="k" style="padding-left:10px; font-size:12.5px;">↳ incluye impuestos/cargos</span><span class="v" id="vCharges">$0</span></div>
           <div class="stat-line"><span class="k">Exceso a repartir</span><span class="v" id="vExcess" style="color:var(--brick)">$0</span></div>
           <div class="stat-line"><span class="k">Extras individuales</span><span class="v" id="vExtras">$0</span></div>
           <div class="stat-line big"><span class="k">Total a recaudar</span><span class="v" id="vGrand">$0</span></div>
@@ -907,16 +1026,16 @@ PAGE = r"""<!DOCTYPE html>
 
 <script>
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,7);
-const CUR = new Intl.NumberFormat('es-DO',{style:'currency',currency:'DOP',maximumFractionDigits:0});
-const money = n => CUR.format(Math.round(n||0));
+const CUR = new Intl.NumberFormat('es-DO',{style:'currency',currency:'DOP',minimumFractionDigits:2,maximumFractionDigits:2});
+const money = n => CUR.format(n||0);
 
 const LS_CUR='poldinas:current', LS_EVENTS='poldinas:events';
 let state = loadCurrent() || blank();
 let staging = [];
 
-function blank(){ return {id:uid(), event:{name:'',place:'',date:'',poldinaValue:1000}, people:[], fines:[], items:[]}; }
+function blank(){ return {id:uid(), event:{name:'',place:'',date:'',poldinaValue:1000}, people:[], fines:[], items:[], charges:[]}; }
 function loadCurrent(){ try{ const r=localStorage.getItem(LS_CUR); const s=r?JSON.parse(r):null;
-  if(s && !s.fines) s.fines=[]; if(s && !s.items) s.items=[]; return s; }catch(e){ return null; } }
+  if(s && !s.fines) s.fines=[]; if(s && !s.items) s.items=[]; if(s && !s.charges) s.charges=[]; return s; }catch(e){ return null; } }
 function loadEvents(){ try{ const r=localStorage.getItem(LS_EVENTS); return r?JSON.parse(r):[]; }catch(e){ return []; } }
 
 let saveT=null;
@@ -933,6 +1052,10 @@ async function doCalc(){
     renderSummary(await res.json());
   }catch(e){ renderSummary(jsCalc()); }
 }
+function itemPersonIds(i){
+  if(Array.isArray(i.personIds)) return i.personIds.filter(Boolean);
+  return i.personId ? [i.personId] : [];
+}
 function jsCalc(){
   const pv=+state.event.poldinaValue||1000;
   const finesByPerson={};
@@ -941,18 +1064,32 @@ function jsCalc(){
   const pool=totalPold*pv;
   const sharedItems=state.items.filter(i=>i.kind!=='individual');
   const indivItems=state.items.filter(i=>i.kind==='individual');
-  const indivAssigned=indivItems.filter(i=>i.personId);
-  const indivUnassigned=indivItems.filter(i=>!i.personId);
-  const sharedCost=sharedItems.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
+  const indivAssigned=indivItems.filter(i=>itemPersonIds(i).length);
+  const indivUnassigned=indivItems.filter(i=>!itemPersonIds(i).length);
+  const itemsCost=sharedItems.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
+  const chargesTotal=(state.charges||[]).reduce((s,ch)=>s+(+ch.amount||0),0);
+  const sharedCost=itemsCost+chargesTotal;
   const excess=Math.max(0,sharedCost-pool), surplus=Math.max(0,pool-sharedCost), covered=Math.min(sharedCost,pool);
-  const per = state.people.length ? excess/state.people.length : 0;
-  const rows=state.people.map(p=>{ const pold=finesByPerson[p.id]||0; const fine=pold*pv;
-    const ex=indivAssigned.filter(i=>i.personId===p.id).reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
-    const sh=excess>0 ? per : 0;
-    return {id:p.id,name:p.name||'(sin nombre)',poldinas:pold,fine,excessShare:sh,extras:ex,total:fine+ex+sh,fined:pold>0}; });
-  const extrasTotal=indivAssigned.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
+  const went = p => p.attended !== false;
+  const attendees = state.people.filter(went);
+  const per = attendees.length ? excess/attendees.length : 0;
+  const attIds = new Set(attendees.map(p=>p.id));
+  // Repartir cada item individual entre sus asignados que asistieron.
+  const extrasByPerson={};
+  indivAssigned.forEach(i=>{
+    const lineTotal=(+i.qty||0)*(+i.unitPrice||0);
+    const payers=itemPersonIds(i).filter(pid=>attIds.has(pid));
+    if(!payers.length) return;
+    const share=lineTotal/payers.length;
+    payers.forEach(pid=>{ extrasByPerson[pid]=(extrasByPerson[pid]||0)+share; });
+  });
+  const rows=state.people.map(p=>{ const pold=finesByPerson[p.id]||0; const fine=pold*pv; const g=went(p);
+    const ex=g ? (extrasByPerson[p.id]||0) : 0;
+    const sh=(excess>0 && g) ? per : 0;
+    return {id:p.id,name:p.name||'(sin nombre)',poldinas:pold,fine,excessShare:sh,extras:ex,total:fine+ex+sh,fined:pold>0,attended:g}; });
+  const extrasTotal=Object.values(extrasByPerson).reduce((a,b)=>a+b,0);
   const unassignedTotal=indivUnassigned.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
-  return {totalPoldinas:totalPold,pool,sharedCost,covered,excess,surplus,extrasTotal,unassignedTotal,unassignedCount:indivUnassigned.length,grand:rows.reduce((s,r)=>s+r.total,0),excessPer:per,rows};
+  return {totalPoldinas:totalPold,pool,sharedCost,itemsCost,chargesTotal,covered,excess,surplus,extrasTotal,unassignedTotal,unassignedCount:indivUnassigned.length,attendeesCount:attendees.length,grand:rows.reduce((s,r)=>s+r.total,0),excessPer:per,rows};
 }
 
 /* ---------- helpers DOM ---------- */
@@ -962,8 +1099,9 @@ function el(tag, attrs={}, kids=[]){ const n=document.createElement(tag);
   (Array.isArray(kids)?kids:[kids]).forEach(c=>{ if(c!=null)n.append(c.nodeType?c:document.createTextNode(c)); });
   return n; }
 function fillOptions(sel, selected){ sel.innerHTML='';
-  if(!state.people.length){ sel.append(el('option',{value:''},'- agrega personas -')); return; }
-  state.people.forEach(p=>{ const o=el('option',{value:p.id}, p.name||'(sin nombre)'); if(p.id===selected)o.selected=true; sel.append(o); }); }
+  const asistieron=state.people.filter(p=>p.attended!==false);
+  if(!asistieron.length){ sel.append(el('option',{value:''},'- nadie asistió aún -')); return; }
+  asistieron.forEach(p=>{ const o=el('option',{value:p.id}, p.name||'(sin nombre)'); if(p.id===selected)o.selected=true; sel.append(o); }); }
 function kindSelect(value, onChange){
   const sel=document.createElement('select');
   [['shared','Común'],['individual','Individual']].forEach(([v,label])=>{
@@ -972,27 +1110,53 @@ function kindSelect(value, onChange){
   sel.addEventListener('change', onChange);
   return sel;
 }
+// Normaliza un item para que siempre use la lista personIds.
+function getItemPersonIds(it){
+  if(Array.isArray(it.personIds)) return it.personIds.filter(Boolean);
+  return it.personId ? [it.personId] : [];
+}
+// Selector de varias personas (chips). onChange recibe la lista actualizada.
+function peopleChips(selectedIds, onChange){
+  const box=document.createElement('div'); box.className='chips';
+  const asistieron=state.people.filter(p=>p.attended!==false);
+  if(!asistieron.length){ box.append(el('span',{class:'chips-empty'},'nadie asistió')); return box; }
+  const sel=new Set(selectedIds);
+  asistieron.forEach(p=>{
+    const on=sel.has(p.id);
+    const chip=el('button',{class: on?'chip on':'chip', type:'button', onclick:()=>{
+      if(sel.has(p.id)) sel.delete(p.id); else sel.add(p.id);
+      onChange([...sel]);
+    }}, p.name||'(sin nombre)');
+    box.append(chip);
+  });
+  return box;
+}
 function nameOf(id){ return (state.people.find(p=>p.id===id)||{}).name || '(sin nombre)'; }
 function refreshPersonSelects(){
   fillOptions(document.getElementById('fPerson'));
-  fillOptions(document.getElementById('iPerson'));
   renderFines(); renderItems(); renderStaging();
 }
 
 /* ---------- personas ---------- */
 function renderPeople(){ const box=document.getElementById('peopleList'); box.innerHTML='';
-  if(!state.people.length){ box.append(el('div',{class:'empty'},'Aun no hay personas.')); return; }
+  if(!state.people.length){ box.append(el('div',{class:'empty'},'Aun no hay contactos.')); return; }
   state.people.forEach(p=>{
+    if(p.attended===undefined) p.attended=true;
     const count=state.fines.filter(f=>f.personId===p.id).length;
-    const name=el('input',{value:p.name||'',placeholder:'Nombre',oninput:e=>{p.name=e.target.value; refreshPersonSelects(); renderPeople.keepFocus=true; scheduleCalc(); save();}});
+    const name=el('input',{value:p.name||'',placeholder:'Nombre',oninput:e=>{p.name=e.target.value; refreshPersonSelects(); scheduleCalc(); save();}});
     const badge=el('span',{class: count?'pill fined':'pill free'}, count? (count+' poldina'+(count>1?'s':'')) : 'sin multa');
+    const att=el('button',{class: p.attended?'att-btn on':'att-btn off', title:'Cambiar asistencia', onclick:()=>{
+      p.attended=!p.attended;
+      if(!p.attended) state.items=state.items.filter(x=>!(x.kind==='individual'&&x.personId===p.id));
+      renderPeople(); refreshPersonSelects(); scheduleCalc(); save();
+    }}, p.attended?'Asistió':'No asistió');
     const del=el('button',{class:'btn-x',title:'Quitar',onclick:()=>{
       state.people=state.people.filter(x=>x.id!==p.id);
       state.fines=state.fines.filter(x=>x.personId!==p.id);
       state.items=state.items.filter(x=>!(x.kind==='individual'&&x.personId===p.id));
       renderPeople(); refreshPersonSelects(); scheduleCalc(); save();
     }},'X');
-    box.append(el('div',{class:'row row-people2'},[name,badge,del]));
+    box.append(el('div',{class:'row row-people2'},[name,badge,att,del]));
   });
 }
 
@@ -1023,15 +1187,32 @@ function renderItems(){ const box=document.getElementById('itemsList'); box.inne
   state.items.forEach(it=>{
     const desc=el('input',{value:it.desc||'',oninput:e=>{it.desc=e.target.value; save();}});
     const qty=el('input',{type:'number',min:'0',step:'1',value:it.qty??1,oninput:e=>{it.qty=+e.target.value||0; upd(); scheduleCalc(); save();}});
-    const price=el('input',{type:'number',min:'0',step:'100',value:it.unitPrice??0,oninput:e=>{it.unitPrice=+e.target.value||0; upd(); scheduleCalc(); save();}});
-    const kSel=kindSelect(it.kind, e=>{ it.kind=e.target.value; if(it.kind==='shared') it.personId=null; renderItems(); scheduleCalc(); save(); });
-    const pSel=document.createElement('select'); fillOptions(pSel, it.personId);
-    pSel.style.display = it.kind==='individual' ? '' : 'none';
-    pSel.addEventListener('change', e=>{ it.personId=e.target.value; scheduleCalc(); save(); });
+    const price=el('input',{type:'number',min:'0',step:'0.01',value:it.unitPrice??0,oninput:e=>{it.unitPrice=+e.target.value||0; upd(); scheduleCalc(); save();}});
+    const kSel=kindSelect(it.kind, e=>{ it.kind=e.target.value; if(it.kind==='shared'){ it.personIds=[]; it.personId=null; } renderItems(); scheduleCalc(); save(); });
     const amt=el('div',{class:'lineamt'}, money((+it.qty||0)*(+it.unitPrice||0)));
     function upd(){ amt.textContent=money((+it.qty||0)*(+it.unitPrice||0)); }
     const del=el('button',{class:'btn-x',title:'Quitar',onclick:()=>{ state.items=state.items.filter(x=>x.id!==it.id); renderItems(); scheduleCalc(); save(); }},'X');
-    box.append(el('div',{class:'row row-item'},[desc,qty,price,kSel,pSel,amt,del]));
+    const line=el('div',{class:'row row-item'},[desc,qty,price,kSel,amt,del]);
+    const wrap=el('div',{class:'item-wrap'},[line]);
+    if(it.kind==='individual'){
+      it.personIds = getItemPersonIds(it); it.personId=null;
+      const chips=peopleChips(it.personIds, ids=>{ it.personIds=ids; renderItems(); scheduleCalc(); save(); });
+      const hint=el('div',{class:'chips-hint'}, it.personIds.length>1 ? ('Se divide entre '+it.personIds.length+': '+money(((+it.qty||0)*(+it.unitPrice||0))/it.personIds.length)+' c/u') : 'Toca a quién(es) le pertenece');
+      wrap.append(el('div',{class:'chips-row'},[chips,hint]));
+    }
+    box.append(wrap);
+  });
+}
+
+/* ---------- factura: impuestos y cargos ---------- */
+function renderCharges(){ const box=document.getElementById('chargesList'); if(!box) return; box.innerHTML='';
+  if(!state.charges) state.charges=[];
+  if(!state.charges.length){ box.append(el('div',{class:'empty'},'Sin impuestos ni cargos.')); return; }
+  state.charges.forEach(ch=>{
+    const desc=el('input',{value:ch.desc||'',placeholder:'Concepto',oninput:e=>{ch.desc=e.target.value; save();}});
+    const amt=el('input',{type:'number',min:'0',step:'0.01',value:ch.amount??0,oninput:e=>{ch.amount=+e.target.value||0; scheduleCalc(); save();}});
+    const del=el('button',{class:'btn-x',title:'Quitar',onclick:()=>{ state.charges=state.charges.filter(x=>x.id!==ch.id); renderCharges(); scheduleCalc(); save(); }},'X');
+    box.append(el('div',{class:'row row-charge'},[desc,amt,del]));
   });
 }
 
@@ -1039,19 +1220,24 @@ function renderItems(){ const box=document.getElementById('itemsList'); box.inne
 function renderStaging(){ const box=document.getElementById('stagingBox'); box.innerHTML='';
   if(!staging.length){ box.style.display='none'; return; }
   box.style.display='block';
-  box.append(el('div',{class:'note info staging-note'}, staging.length+' item(s) leidos de la factura. Revisa cantidad, precio y tipo antes de confirmar.'));
+  box.append(el('div',{class:'note info staging-note'}, staging.length+' item(s) leidos de la factura. Revisa cantidad, precio, tipo y a quién pertenece antes de confirmar.'));
   staging.forEach((it,idx)=>{
     const desc=el('input',{value:it.desc||'',oninput:e=>{it.desc=e.target.value;}});
     const qty=el('input',{type:'number',min:'0',step:'1',value:it.qty??1,oninput:e=>{it.qty=+e.target.value||0; upd();}});
-    const price=el('input',{type:'number',min:'0',step:'100',value:it.unitPrice??0,oninput:e=>{it.unitPrice=+e.target.value||0; upd();}});
-    const kSel=kindSelect(it.kind, e=>{ it.kind=e.target.value; renderStaging(); });
-    const pSel=document.createElement('select'); fillOptions(pSel, it.personId);
-    pSel.style.display = it.kind==='individual' ? '' : 'none';
-    pSel.addEventListener('change', e=>{ it.personId=e.target.value; });
+    const price=el('input',{type:'number',min:'0',step:'0.01',value:it.unitPrice??0,oninput:e=>{it.unitPrice=+e.target.value||0; upd();}});
+    const kSel=kindSelect(it.kind, e=>{ it.kind=e.target.value; if(it.kind==='shared') it.personIds=[]; renderStaging(); });
     const amt=el('div',{class:'lineamt'}, money((+it.qty||0)*(+it.unitPrice||0)));
     function upd(){ amt.textContent=money((+it.qty||0)*(+it.unitPrice||0)); }
     const del=el('button',{class:'btn-x',onclick:()=>{ staging.splice(idx,1); renderStaging(); }},'X');
-    box.append(el('div',{class:'row row-item'},[desc,qty,price,kSel,pSel,amt,del]));
+    const line=el('div',{class:'row row-item'},[desc,qty,price,kSel,amt,del]);
+    const wrap=el('div',{class:'item-wrap'},[line]);
+    if(it.kind==='individual'){
+      it.personIds = getItemPersonIds(it);
+      const chips=peopleChips(it.personIds, ids=>{ it.personIds=ids; renderStaging(); });
+      const hint=el('div',{class:'chips-hint'}, it.personIds.length>1 ? ('Se divide entre '+it.personIds.length) : 'Toca a quién(es) le pertenece');
+      wrap.append(el('div',{class:'chips-row'},[chips,hint]));
+    }
+    box.append(wrap);
   });
   const confirmBtn=el('button',{class:'btn-primary',style:'margin-top:12px',onclick:confirmStaging},'Agregar todo a la factura');
   const discardBtn=el('button',{class:'btn-ghost',style:'margin-top:12px; margin-left:8px',onclick:()=>{ staging=[]; renderStaging(); }},'Descartar');
@@ -1061,7 +1247,7 @@ function confirmStaging(){
   staging.forEach(it=>{
     state.items.push({id:uid(), desc:it.desc||'Item', qty:+it.qty||0, unitPrice:+it.unitPrice||0,
       kind: it.kind==='individual'?'individual':'shared',
-      personId: it.kind==='individual' ? (it.personId||null) : null});
+      personIds: it.kind==='individual' ? getItemPersonIds(it) : []});
   });
   staging=[]; renderStaging(); renderItems(); scheduleCalc(); save();
   toast('Items agregados a la factura');
@@ -1079,11 +1265,14 @@ function renderStats(c){
   document.getElementById('poldCount').textContent='('+c.totalPoldinas+' pold.)';
   document.getElementById('vPool').textContent=money(c.pool);
   document.getElementById('vShared').textContent=money(c.sharedCost);
+  const rowCh=document.getElementById('rowCharges');
+  if(c.chargesTotal>0){ rowCh.style.display=''; document.getElementById('vCharges').textContent=money(c.chargesTotal); }
+  else { rowCh.style.display='none'; }
   document.getElementById('vExcess').textContent=money(c.excess);
   document.getElementById('vExtras').textContent=money(c.extrasTotal);
   document.getElementById('vGrand').textContent=money(c.grand);
   const nb=document.getElementById('noteBox'); nb.innerHTML='';
-  if(c.excess>0) nb.append(el('div',{class:'note warn'},`El consumo se paso por ${money(c.excess)}. Se reparte entre las ${state.people.length} persona(s) -> ${money(c.excessPer)} c/u.`));
+  if(c.excess>0) nb.append(el('div',{class:'note warn'},`El consumo se paso por ${money(c.excess)}. Se reparte entre los ${c.attendeesCount} que asistieron -> ${money(c.excessPer)} c/u.`));
   if(c.surplus>0) nb.append(el('div',{class:'note info'},`Las multas superan el consumo comun por ${money(c.surplus)} (bolsa sin usar).`));
   if(c.unassignedCount>0) nb.append(el('div',{class:'note warn'},`Hay ${money(c.unassignedTotal)} en ${c.unassignedCount} item(s) individuales sin asignar a nadie. Ve a "Factura" y elige quien lo consumio, o no se cobrara.`));
 }
@@ -1094,7 +1283,9 @@ function renderBreakdown(c){ const box=document.getElementById('breakdown'); box
   const tb=el('tbody');
   c.rows.forEach(r=>{
     const pill = r.fined ? el('span',{class:'pill fined'}, r.poldinas+'p') : el('span',{class:'pill free'},'sin multa');
-    tb.append(el('tr',{},[ el('td',{},[document.createTextNode(r.name),pill]),
+    const nameCell = el('td',{},[document.createTextNode(r.name),pill]);
+    if(r.attended===false) nameCell.append(el('span',{class:'pill ausente'},'no asistió'));
+    tb.append(el('tr',{},[ nameCell,
       el('td',{},money(r.fine)), el('td',{}, r.excessShare?money(r.excessShare):'-'),
       el('td',{}, r.extras?money(r.extras):'-'), el('td',{class:'grand'},money(r.total)) ]));
   });
@@ -1110,7 +1301,7 @@ function renderHistory(){ const box=document.getElementById('histList'); box.inn
   if(!evs.length){ box.append(el('div',{class:'empty'},'Todavia no has guardado eventos.')); return; }
   evs.forEach(ev=>{
     const d=ev.savedAt?new Date(ev.savedAt).toLocaleDateString('es-DO',{day:'2-digit',month:'short',year:'2-digit'}):'';
-    const load=el('button',{class:'btn-ghost btn-sm',onclick:()=>{ state=JSON.parse(JSON.stringify(ev.state)); if(!state.fines)state.fines=[]; if(!state.items)state.items=[]; syncInputs(); renderAll(); save(); toast('Evento cargado'); }},'Cargar');
+    const load=el('button',{class:'btn-ghost btn-sm',onclick:()=>{ state=JSON.parse(JSON.stringify(ev.state)); if(!state.fines)state.fines=[]; if(!state.items)state.items=[]; if(!state.charges)state.charges=[]; syncInputs(); renderAll(); save(); toast('Evento cargado'); }},'Cargar');
     const del=el('button',{class:'btn-x',title:'Eliminar',onclick:()=>{ const list=loadEvents().filter(e=>e.id!==ev.id); localStorage.setItem(LS_EVENTS,JSON.stringify(list)); renderHistory(); toast('Evento eliminado'); }},'X');
     box.append(el('div',{class:'hist-item'},[ el('span',{class:'hname'}, ev.name||'Evento'), el('span',{class:'hdate'}, d), load, del ]));
   });
@@ -1123,7 +1314,7 @@ function syncInputs(){
   document.getElementById('evDate').value=state.event.date||'';
   document.getElementById('evPV').value=state.event.poldinaValue??1000;
 }
-function renderAll(){ renderPeople(); renderFines(); renderItems(); refreshPersonSelects(); scheduleCalc(); }
+function renderAll(){ renderPeople(); renderFines(); renderItems(); renderCharges(); refreshPersonSelects(); scheduleCalc(); }
 
 function applyInvoiceMeta(meta){
   if(!meta) return;
@@ -1139,12 +1330,24 @@ function applyInvoiceMeta(meta){
   save();
 }
 function addTaxDifferenceIfNeeded(meta){
-  if(!meta || !meta.total) return;
+  if(!meta) return;
+  if(!state.charges) state.charges=[];
+  // 1) Si se detectaron cargos concretos (ITBIS, Ley, servicio), usarlos tal cual.
+  if(Array.isArray(meta.charges) && meta.charges.length){
+    meta.charges.forEach(ch=>{ state.charges.push({id:uid(), desc:ch.desc||'Cargo', amount:+ch.amount||0}); });
+    renderCharges();
+    toast('Impuestos y cargos detectados y agregados aparte.');
+    return;
+  }
+  // 2) Respaldo: si solo hay total (y quizá subtotal), agregar la diferencia como cargo.
+  if(!meta.total) return;
   const sumStaging = staging.reduce((s,it)=> s+(+it.qty||0)*(+it.unitPrice||0), 0);
-  const diff = Math.round((+meta.total||0) - sumStaging);
-  if(diff > 1){
-    staging.push({desc:'Cargos e impuestos (ITBIS/Ley/servicio)', qty:1, unitPrice:diff, kind:'shared', personId:null});
-    toast('Se detecto un total de '+money(meta.total)+'. Se agrego la diferencia ('+money(diff)+') como cargo comun.');
+  const base = (meta.subtotal!=null && +meta.subtotal>0) ? +meta.subtotal : sumStaging;
+  const diff = Math.round(((+meta.total||0) - base) * 100) / 100;
+  if(diff > 0.01){
+    state.charges.push({id:uid(), desc:'Impuestos y cargos (ITBIS/Ley/servicio)', amount:diff});
+    renderCharges();
+    toast('Total detectado '+money(meta.total)+'. Impuestos y cargos ('+money(diff)+') agregados aparte.');
   }
 }
 
@@ -1251,18 +1454,22 @@ function bind(){ const on=(id,ev,fn)=>document.getElementById(id).addEventListen
     renderFines(); renderPeople(); scheduleCalc(); save(); toast('Poldina registrada');
   });
 
-  document.getElementById('iKind').addEventListener('change', e=>{
-    document.getElementById('iPersonWrap').style.display = e.target.value==='individual' ? '' : 'none'; });
-
   on('btnAddItem','click',()=>{
     const d=document.getElementById('iDesc').value.trim(); if(!d){toast('Escribe la descripcion');return;}
     const kind=document.getElementById('iKind').value;
-    const personId = kind==='individual' ? document.getElementById('iPerson').value : null;
-    if(kind==='individual' && !personId){ toast('Selecciona quien lo consumio'); return; }
     state.items.push({id:uid(), desc:d, qty:+document.getElementById('iQty').value||0,
-      unitPrice:+document.getElementById('iPrice').value||0, kind, personId});
+      unitPrice:+document.getElementById('iPrice').value||0, kind, personIds:[]});
     document.getElementById('iDesc').value=''; document.getElementById('iQty').value=1; document.getElementById('iPrice').value='';
     renderItems(); scheduleCalc(); save(); document.getElementById('iDesc').focus();
+    if(kind==='individual') toast('Item agregado. Abajo marca a quién(es) le pertenece.');
+  });
+
+  on('btnAddCharge','click',()=>{
+    const d=document.getElementById('chDesc').value.trim(); if(!d){toast('Escribe el concepto');return;}
+    if(!state.charges) state.charges=[];
+    state.charges.push({id:uid(), desc:d, amount:+document.getElementById('chAmt').value||0});
+    document.getElementById('chDesc').value=''; document.getElementById('chAmt').value='';
+    renderCharges(); scheduleCalc(); save(); document.getElementById('chDesc').focus();
   });
 
   document.getElementById('invoiceFile').addEventListener('change', e=>{
