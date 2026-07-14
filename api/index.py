@@ -53,6 +53,22 @@ def guess_kind(desc):
     return "individual" if any(k in d for k in DRINK_KEYWORDS) else "shared"
 
 
+def item_person_ids(i):
+    """IDs de personas asignadas a un ítem individual. Acepta personIds (lista) o personId (viejo)."""
+    ids = i.get("personIds")
+    if isinstance(ids, list):
+        return [x for x in ids if x]
+    pid = i.get("personId")
+    return [pid] if pid else []
+
+
+def item_people_names(i, name_of):
+    ids = item_person_ids(i)
+    if not ids:
+        return "-"
+    return ", ".join(name_of.get(pid, "?") for pid in ids)
+
+
 # =============================================================
 #  Cálculo (fuente única de verdad)
 # =============================================================
@@ -73,8 +89,9 @@ def compute(state):
 
     shared_items = [i for i in items if i.get("kind") != "individual"]
     indiv_items = [i for i in items if i.get("kind") == "individual"]
-    indiv_assigned = [i for i in indiv_items if i.get("personId")]
-    indiv_unassigned = [i for i in indiv_items if not i.get("personId")]
+
+    indiv_assigned = [i for i in indiv_items if item_person_ids(i)]
+    indiv_unassigned = [i for i in indiv_items if not item_person_ids(i)]
 
     shared_cost = sum(num(i.get("qty")) * num(i.get("unitPrice")) for i in shared_items)
     excess = max(0.0, shared_cost - pool)
@@ -86,18 +103,28 @@ def compute(state):
         return p.get("attended", True) is not False
 
     attendees = [p for p in people if attended(p)]
+    attendee_ids = {p.get("id") for p in attendees}
     excess_per = (excess / len(attendees)) if attendees else 0.0
+
+    # Cuánto le toca a cada persona de los ítems individuales.
+    # El costo de cada ítem se reparte por igual entre las personas asignadas
+    # que además asistieron. (Un ausente no consumió, así que no cuenta.)
+    extras_by_person = {}
+    for i in indiv_assigned:
+        line_total = num(i.get("qty")) * num(i.get("unitPrice"))
+        payers = [pid for pid in item_person_ids(i) if pid in attendee_ids]
+        if not payers:
+            continue
+        share = line_total / len(payers)
+        for pid in payers:
+            extras_by_person[pid] = extras_by_person.get(pid, 0.0) + share
 
     rows = []
     for p in people:
         pold = fines_by_person.get(p.get("id"), 0)
         fine = pold * pv
         went = attended(p)
-        # Los extras solo cuentan para quien asistió (los ausentes no consumieron).
-        ex = sum(
-            num(i.get("qty")) * num(i.get("unitPrice"))
-            for i in indiv_assigned if i.get("personId") == p.get("id")
-        ) if went else 0.0
+        ex = extras_by_person.get(p.get("id"), 0.0) if went else 0.0
         # El exceso solo lo pagan los que asistieron.
         eshare = excess_per if (excess > 0 and went) else 0.0
         rows.append({
@@ -112,12 +139,8 @@ def compute(state):
             "attended": went,
         })
 
-    # Solo suman al total los extras de quienes asistieron.
-    attendee_ids = {p.get("id") for p in attendees}
-    extras_total = sum(
-        num(i.get("qty")) * num(i.get("unitPrice"))
-        for i in indiv_assigned if i.get("personId") in attendee_ids
-    )
+    # Solo suma al total lo que efectivamente se cobró a personas que asistieron.
+    extras_total = sum(extras_by_person.values())
     unassigned_total = sum(num(i.get("qty")) * num(i.get("unitPrice")) for i in indiv_unassigned)
     grand = sum(r["total"] for r in rows)
 
@@ -414,7 +437,7 @@ def build_pdf(state):
             table.row(["Item", "Cant.", "Precio", "Subtotal", "Tipo", "Persona"])
             for i in items:
                 kind = "Individual" if i.get("kind") == "individual" else "Comun"
-                person = name_of.get(i.get("personId"), "-") if i.get("kind") == "individual" else "-"
+                person = item_people_names(i, name_of) if i.get("kind") == "individual" else "-"
                 table.row([
                     latin(i.get("desc")), str(inum(i.get("qty"))),
                     money(num(i.get("unitPrice"))),
@@ -508,15 +531,18 @@ def build_xlsx(state):
     for i in (state.get("items", []) or []):
         q, p = num(i.get("qty")), num(i.get("unitPrice"))
         kind = "Individual" if i.get("kind") == "individual" else "Comun"
-        person = name_of.get(i.get("personId"), "") if i.get("kind") == "individual" else ""
+        person = item_people_names(i, name_of) if i.get("kind") == "individual" else ""
+        if person == "-":
+            person = ""
         ws3.append([i.get("desc", ""), inum(i.get("qty")), p, q * p, kind, person])
     for col in ("C", "D"):
         for cell in ws3[col]:
             if isinstance(cell.value, (int, float)):
                 cell.number_format = MONEY
     ws3.column_dimensions["A"].width = 26
-    for col in ("B", "C", "D", "E", "F"):
+    for col in ("B", "C", "D", "E"):
         ws3.column_dimensions[col].width = 13
+    ws3.column_dimensions["F"].width = 28
 
     ws4 = wb.create_sheet("Poldinas")
     ws4.append(["Persona", "Fecha", "Hora", "Motivo", "Descripcion"])
@@ -716,11 +742,21 @@ PAGE = r"""<!DOCTYPE html>
   .row{display:grid; gap:9px; align-items:center; padding:10px 0; border-top:1px dashed var(--line);}
   .row:first-child{border-top:none;}
   .row-people2{grid-template-columns:1fr 100px 96px auto;}
-  .row-item{grid-template-columns:1.3fr 60px 90px 100px 130px 90px auto;}
+  .row-item{grid-template-columns:1.4fr 60px 100px 110px 100px auto;}
   @media(max-width:760px){ .row-item{grid-template-columns:1fr 1fr;} .row-people2{grid-template-columns:1fr auto auto auto;} }
   .att-btn{padding:6px 8px; font-size:11.5px; border-radius:7px; border:1px solid var(--line); white-space:nowrap;}
   .att-btn.on{background:var(--pine-soft); color:var(--pine); border-color:var(--pine-soft);}
   .att-btn.off{background:var(--brick-soft); color:var(--brick); border-color:var(--brick-soft);}
+  .item-wrap{padding:10px 0; border-top:1px dashed var(--line);}
+  .item-wrap:first-child{border-top:none;}
+  .item-wrap .row-item{padding:0; border-top:none;}
+  .chips-row{margin-top:8px; padding-left:2px;}
+  .chips{display:flex; flex-wrap:wrap; gap:6px;}
+  .chip{background:#fff; border:1px solid var(--line); color:var(--ink-soft); border-radius:20px; padding:4px 12px; font-size:12px; font-weight:500;}
+  .chip.on{background:var(--brass); color:#fff; border-color:var(--brass);}
+  .chip:hover{border-color:var(--brass);}
+  .chips-empty{font-size:12px; color:var(--brick); font-style:italic;}
+  .chips-hint{font-size:11px; color:var(--ink-soft); margin-top:5px;}
   .row .lineamt{font-family:"JetBrains Mono",monospace; font-size:13px; text-align:right; color:var(--ink-soft); align-self:center; white-space:nowrap;}
   .empty{color:var(--ink-soft); font-size:13.5px; text-align:center; padding:16px 8px; font-style:italic;}
   .meter-wrap{margin:6px 0 14px;}
@@ -873,14 +909,13 @@ PAGE = r"""<!DOCTYPE html>
 
           <div style="margin:20px 0 8px; font-weight:600; font-size:13px; color:var(--ink-soft);">Items confirmados</div>
           <div id="itemsList"></div>
-          <div class="field-row" style="margin-top:14px; grid-template-columns:1.3fr .6fr .9fr .9fr 1fr auto; gap:10px" id="addItemRow">
+          <div class="field-row" style="margin-top:14px; grid-template-columns:1.6fr .6fr .9fr .9fr auto; gap:10px" id="addItemRow">
             <div><label>Descripción</label><input id="iDesc" placeholder="Ej: Pizza mediana"></div>
             <div><label>Cant.</label><input id="iQty" type="number" min="0" step="1" value="1"></div>
             <div><label>Precio unit.</label><input id="iPrice" type="number" min="0" step="100" placeholder="1000"></div>
             <div><label>Tipo</label>
               <select id="iKind"><option value="shared">Común</option><option value="individual">Individual</option></select>
             </div>
-            <div id="iPersonWrap" style="display:none"><label>Persona</label><select id="iPerson"></select></div>
             <div style="display:flex; align-items:flex-end"><button class="btn-brass" id="btnAddItem" style="width:100%">Agregar</button></div>
           </div>
         </div>
@@ -957,6 +992,10 @@ async function doCalc(){
     renderSummary(await res.json());
   }catch(e){ renderSummary(jsCalc()); }
 }
+function itemPersonIds(i){
+  if(Array.isArray(i.personIds)) return i.personIds.filter(Boolean);
+  return i.personId ? [i.personId] : [];
+}
 function jsCalc(){
   const pv=+state.event.poldinaValue||1000;
   const finesByPerson={};
@@ -965,19 +1004,28 @@ function jsCalc(){
   const pool=totalPold*pv;
   const sharedItems=state.items.filter(i=>i.kind!=='individual');
   const indivItems=state.items.filter(i=>i.kind==='individual');
-  const indivAssigned=indivItems.filter(i=>i.personId);
-  const indivUnassigned=indivItems.filter(i=>!i.personId);
+  const indivAssigned=indivItems.filter(i=>itemPersonIds(i).length);
+  const indivUnassigned=indivItems.filter(i=>!itemPersonIds(i).length);
   const sharedCost=sharedItems.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
   const excess=Math.max(0,sharedCost-pool), surplus=Math.max(0,pool-sharedCost), covered=Math.min(sharedCost,pool);
   const went = p => p.attended !== false;
   const attendees = state.people.filter(went);
   const per = attendees.length ? excess/attendees.length : 0;
   const attIds = new Set(attendees.map(p=>p.id));
+  // Repartir cada item individual entre sus asignados que asistieron.
+  const extrasByPerson={};
+  indivAssigned.forEach(i=>{
+    const lineTotal=(+i.qty||0)*(+i.unitPrice||0);
+    const payers=itemPersonIds(i).filter(pid=>attIds.has(pid));
+    if(!payers.length) return;
+    const share=lineTotal/payers.length;
+    payers.forEach(pid=>{ extrasByPerson[pid]=(extrasByPerson[pid]||0)+share; });
+  });
   const rows=state.people.map(p=>{ const pold=finesByPerson[p.id]||0; const fine=pold*pv; const g=went(p);
-    const ex=g ? indivAssigned.filter(i=>i.personId===p.id).reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0) : 0;
+    const ex=g ? (extrasByPerson[p.id]||0) : 0;
     const sh=(excess>0 && g) ? per : 0;
     return {id:p.id,name:p.name||'(sin nombre)',poldinas:pold,fine,excessShare:sh,extras:ex,total:fine+ex+sh,fined:pold>0,attended:g}; });
-  const extrasTotal=indivAssigned.filter(i=>attIds.has(i.personId)).reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
+  const extrasTotal=Object.values(extrasByPerson).reduce((a,b)=>a+b,0);
   const unassignedTotal=indivUnassigned.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
   return {totalPoldinas:totalPold,pool,sharedCost,covered,excess,surplus,extrasTotal,unassignedTotal,unassignedCount:indivUnassigned.length,attendeesCount:attendees.length,grand:rows.reduce((s,r)=>s+r.total,0),excessPer:per,rows};
 }
@@ -1000,10 +1048,30 @@ function kindSelect(value, onChange){
   sel.addEventListener('change', onChange);
   return sel;
 }
+// Normaliza un item para que siempre use la lista personIds.
+function getItemPersonIds(it){
+  if(Array.isArray(it.personIds)) return it.personIds.filter(Boolean);
+  return it.personId ? [it.personId] : [];
+}
+// Selector de varias personas (chips). onChange recibe la lista actualizada.
+function peopleChips(selectedIds, onChange){
+  const box=document.createElement('div'); box.className='chips';
+  const asistieron=state.people.filter(p=>p.attended!==false);
+  if(!asistieron.length){ box.append(el('span',{class:'chips-empty'},'nadie asistió')); return box; }
+  const sel=new Set(selectedIds);
+  asistieron.forEach(p=>{
+    const on=sel.has(p.id);
+    const chip=el('button',{class: on?'chip on':'chip', type:'button', onclick:()=>{
+      if(sel.has(p.id)) sel.delete(p.id); else sel.add(p.id);
+      onChange([...sel]);
+    }}, p.name||'(sin nombre)');
+    box.append(chip);
+  });
+  return box;
+}
 function nameOf(id){ return (state.people.find(p=>p.id===id)||{}).name || '(sin nombre)'; }
 function refreshPersonSelects(){
   fillOptions(document.getElementById('fPerson'));
-  fillOptions(document.getElementById('iPerson'));
   renderFines(); renderItems(); renderStaging();
 }
 
@@ -1058,14 +1126,19 @@ function renderItems(){ const box=document.getElementById('itemsList'); box.inne
     const desc=el('input',{value:it.desc||'',oninput:e=>{it.desc=e.target.value; save();}});
     const qty=el('input',{type:'number',min:'0',step:'1',value:it.qty??1,oninput:e=>{it.qty=+e.target.value||0; upd(); scheduleCalc(); save();}});
     const price=el('input',{type:'number',min:'0',step:'100',value:it.unitPrice??0,oninput:e=>{it.unitPrice=+e.target.value||0; upd(); scheduleCalc(); save();}});
-    const kSel=kindSelect(it.kind, e=>{ it.kind=e.target.value; if(it.kind==='shared') it.personId=null; renderItems(); scheduleCalc(); save(); });
-    const pSel=document.createElement('select'); fillOptions(pSel, it.personId);
-    pSel.style.display = it.kind==='individual' ? '' : 'none';
-    pSel.addEventListener('change', e=>{ it.personId=e.target.value; scheduleCalc(); save(); });
+    const kSel=kindSelect(it.kind, e=>{ it.kind=e.target.value; if(it.kind==='shared'){ it.personIds=[]; it.personId=null; } renderItems(); scheduleCalc(); save(); });
     const amt=el('div',{class:'lineamt'}, money((+it.qty||0)*(+it.unitPrice||0)));
     function upd(){ amt.textContent=money((+it.qty||0)*(+it.unitPrice||0)); }
     const del=el('button',{class:'btn-x',title:'Quitar',onclick:()=>{ state.items=state.items.filter(x=>x.id!==it.id); renderItems(); scheduleCalc(); save(); }},'X');
-    box.append(el('div',{class:'row row-item'},[desc,qty,price,kSel,pSel,amt,del]));
+    const line=el('div',{class:'row row-item'},[desc,qty,price,kSel,amt,del]);
+    const wrap=el('div',{class:'item-wrap'},[line]);
+    if(it.kind==='individual'){
+      it.personIds = getItemPersonIds(it); it.personId=null;
+      const chips=peopleChips(it.personIds, ids=>{ it.personIds=ids; renderItems(); scheduleCalc(); save(); });
+      const hint=el('div',{class:'chips-hint'}, it.personIds.length>1 ? ('Se divide entre '+it.personIds.length+': '+money(((+it.qty||0)*(+it.unitPrice||0))/it.personIds.length)+' c/u') : 'Toca a quién(es) le pertenece');
+      wrap.append(el('div',{class:'chips-row'},[chips,hint]));
+    }
+    box.append(wrap);
   });
 }
 
@@ -1078,14 +1151,19 @@ function renderStaging(){ const box=document.getElementById('stagingBox'); box.i
     const desc=el('input',{value:it.desc||'',oninput:e=>{it.desc=e.target.value;}});
     const qty=el('input',{type:'number',min:'0',step:'1',value:it.qty??1,oninput:e=>{it.qty=+e.target.value||0; upd();}});
     const price=el('input',{type:'number',min:'0',step:'100',value:it.unitPrice??0,oninput:e=>{it.unitPrice=+e.target.value||0; upd();}});
-    const kSel=kindSelect(it.kind, e=>{ it.kind=e.target.value; renderStaging(); });
-    const pSel=document.createElement('select'); fillOptions(pSel, it.personId);
-    pSel.style.display = it.kind==='individual' ? '' : 'none';
-    pSel.addEventListener('change', e=>{ it.personId=e.target.value; });
+    const kSel=kindSelect(it.kind, e=>{ it.kind=e.target.value; if(it.kind==='shared') it.personIds=[]; renderStaging(); });
     const amt=el('div',{class:'lineamt'}, money((+it.qty||0)*(+it.unitPrice||0)));
     function upd(){ amt.textContent=money((+it.qty||0)*(+it.unitPrice||0)); }
     const del=el('button',{class:'btn-x',onclick:()=>{ staging.splice(idx,1); renderStaging(); }},'X');
-    box.append(el('div',{class:'row row-item'},[desc,qty,price,kSel,pSel,amt,del]));
+    const line=el('div',{class:'row row-item'},[desc,qty,price,kSel,amt,del]);
+    const wrap=el('div',{class:'item-wrap'},[line]);
+    if(it.kind==='individual'){
+      it.personIds = getItemPersonIds(it);
+      const chips=peopleChips(it.personIds, ids=>{ it.personIds=ids; renderStaging(); });
+      const hint=el('div',{class:'chips-hint'}, it.personIds.length>1 ? ('Se divide entre '+it.personIds.length) : 'Toca a quién(es) le pertenece');
+      wrap.append(el('div',{class:'chips-row'},[chips,hint]));
+    }
+    box.append(wrap);
   });
   const confirmBtn=el('button',{class:'btn-primary',style:'margin-top:12px',onclick:confirmStaging},'Agregar todo a la factura');
   const discardBtn=el('button',{class:'btn-ghost',style:'margin-top:12px; margin-left:8px',onclick:()=>{ staging=[]; renderStaging(); }},'Descartar');
@@ -1095,7 +1173,7 @@ function confirmStaging(){
   staging.forEach(it=>{
     state.items.push({id:uid(), desc:it.desc||'Item', qty:+it.qty||0, unitPrice:+it.unitPrice||0,
       kind: it.kind==='individual'?'individual':'shared',
-      personId: it.kind==='individual' ? (it.personId||null) : null});
+      personIds: it.kind==='individual' ? getItemPersonIds(it) : []});
   });
   staging=[]; renderStaging(); renderItems(); scheduleCalc(); save();
   toast('Items agregados a la factura');
@@ -1287,18 +1365,14 @@ function bind(){ const on=(id,ev,fn)=>document.getElementById(id).addEventListen
     renderFines(); renderPeople(); scheduleCalc(); save(); toast('Poldina registrada');
   });
 
-  document.getElementById('iKind').addEventListener('change', e=>{
-    document.getElementById('iPersonWrap').style.display = e.target.value==='individual' ? '' : 'none'; });
-
   on('btnAddItem','click',()=>{
     const d=document.getElementById('iDesc').value.trim(); if(!d){toast('Escribe la descripcion');return;}
     const kind=document.getElementById('iKind').value;
-    const personId = kind==='individual' ? document.getElementById('iPerson').value : null;
-    if(kind==='individual' && !personId){ toast('Selecciona quien lo consumio'); return; }
     state.items.push({id:uid(), desc:d, qty:+document.getElementById('iQty').value||0,
-      unitPrice:+document.getElementById('iPrice').value||0, kind, personId});
+      unitPrice:+document.getElementById('iPrice').value||0, kind, personIds:[]});
     document.getElementById('iDesc').value=''; document.getElementById('iQty').value=1; document.getElementById('iPrice').value='';
     renderItems(); scheduleCalc(); save(); document.getElementById('iDesc').focus();
+    if(kind==='individual') toast('Item agregado. Abajo marca a quién(es) le pertenece.');
   });
 
   document.getElementById('invoiceFile').addEventListener('change', e=>{
