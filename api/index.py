@@ -42,6 +42,8 @@ DRINK_KEYWORDS = [
     "gaseosa", "cerveza", "cola", "malta", "jugo", "agua", "refresco",
     "limonada", "te", "café", "cafe", "poker", "aguila", "águila",
     "soda", "bebida", "vino", "whisky", "aguardiente", "ron", "michelada",
+    "presidente", "heineken", "corona", "modelo", "brahma", "stella",
+    "paulaner", "pellegrino", "sprite", "cocacola", "coca cola",
 ]
 
 
@@ -78,14 +80,7 @@ def compute(state):
     surplus = max(0.0, pool - shared_cost)
     covered = min(shared_cost, pool)
 
-    non_fined = [p for p in people if fines_by_person.get(p.get("id"), 0) == 0]
-    base = non_fined
-    fallback = False
-    if excess > 0 and len(non_fined) == 0:
-        base = people
-        fallback = True
-    excess_per = (excess / len(base)) if base else 0.0
-    base_ids = {p.get("id") for p in base}
+    excess_per = (excess / len(people)) if people else 0.0
 
     rows = []
     for p in people:
@@ -95,8 +90,7 @@ def compute(state):
             num(i.get("qty")) * num(i.get("unitPrice"))
             for i in indiv_assigned if i.get("personId") == p.get("id")
         )
-        pays = excess > 0 and p.get("id") in base_ids
-        eshare = excess_per if pays else 0.0
+        eshare = excess_per if excess > 0 else 0.0
         rows.append({
             "id": p.get("id"),
             "name": p.get("name") or "(sin nombre)",
@@ -125,8 +119,6 @@ def compute(state):
         "unassignedCount": len(indiv_unassigned),
         "grand": grand,
         "excessPer": excess_per,
-        "nonFinedCount": len(non_fined),
-        "fallback": fallback,
         "rows": rows,
     }
 
@@ -142,11 +134,22 @@ PATTERNS = [
 ]
 
 
+SKIP_KEYWORDS = [
+    "total", "subtotal", "base imponible", "itbis", "descuento", "cambio",
+    "entregado", "propina", "servicio", "impuesto", "rnc", "ncf", "factura",
+    "mesa", "mesero", "cajero", "cliente", "salonero", "hora", "fecha",
+    "forma de pago", "ley ",
+]
+
+
 def parse_invoice_text(text):
     items = []
     for raw in (text or "").splitlines():
         line = raw.strip()
         if not line:
+            continue
+        low = line.lower()
+        if any(k in low for k in SKIP_KEYWORDS):
             continue
         m = None
         for pat in PATTERNS:
@@ -157,7 +160,7 @@ def parse_invoice_text(text):
             continue
         gd = m.groupdict()
         qty = int(gd.get("qty") or 1)
-        price_raw = gd["price"].replace(".", "").replace(",", "")
+        price_raw = gd["price"].replace(",", "")
         try:
             price = float(price_raw)
         except ValueError:
@@ -173,6 +176,59 @@ def parse_invoice_text(text):
             "kind": guess_kind(desc),
         })
     return items
+
+
+DATE_RE = re.compile(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})")
+
+
+def _to_number(s):
+    return float(s.replace(",", ""))
+
+
+def detect_totals_and_meta(text):
+    meta = {}
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    if lines:
+        meta["place"] = lines[0][:80]
+    for line in lines:
+        low = line.lower()
+        num_m = re.search(r"([\d.,]+)\s*$", line)
+        if not num_m:
+            continue
+        try:
+            value = _to_number(num_m.group(1))
+        except ValueError:
+            continue
+        if ("subtotal" in low or "base imponible" in low) and "subtotal" not in meta:
+            meta["subtotal"] = value
+        elif low.startswith("total") and "total" not in meta:
+            meta["total"] = value
+    dm = DATE_RE.search(text or "")
+    if dm:
+        d, mo, y = dm.groups()
+        y = ("20" + y) if len(y) == 2 else y
+        try:
+            meta["date"] = f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+        except ValueError:
+            pass
+    return meta
+
+
+# =============================================================
+#  Lectura de PDF con texto real — gratis, sin IA
+#  (solo funciona si el PDF tiene texto de verdad adentro, no si es
+#  una foto/escaneo guardado como PDF)
+# =============================================================
+def extract_pdf_text(file_bytes):
+    import pdfplumber
+
+    parts = []
+    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text() or ""
+            if t:
+                parts.append(t)
+    return "\n".join(parts).strip()
 
 
 # =============================================================
@@ -194,7 +250,7 @@ def _extract_json_object(text):
     return json.loads(text[start:end + 1])
 
 
-def extract_invoice_items(file_bytes, mime_type):
+def extract_invoice_data(file_bytes, mime_type):
     import requests
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -210,14 +266,21 @@ def extract_invoice_items(file_bytes, mime_type):
     )
 
     prompt = (
-        "Extrae todos los items de esta factura o recibo de consumo. "
-        "Responde SOLO con un JSON valido, sin texto adicional ni comentarios, con esta forma exacta: "
-        '{"items":[{"desc":"nombre del item","qty":1,"unitPrice":0,"kind":"shared"}]}. '
-        'Usa kind="shared" para comida para compartir (pizzas, platos grandes, entradas) y '
-        'kind="individual" para bebidas o consumos personales (gaseosas, cervezas, jugos, postres individuales). '
-        "qty es la cantidad (numero entero) y unitPrice el precio unitario en pesos, sin simbolos ni puntos de miles. "
-        "Si el recibo muestra el precio total de la linea en vez del unitario, calcula el unitario dividiendo el total entre la cantidad. "
-        "Ignora totales, subtotales, impuestos y propinas: solo items consumibles."
+        "Analiza esta factura o recibo de consumo. Responde SOLO con un JSON valido, sin texto adicional ni "
+        "comentarios, con esta forma exacta: "
+        '{"place":"nombre del establecimiento","date":"YYYY-MM-DD","subtotal":0,"total":0,'
+        '"items":[{"desc":"nombre del item","qty":1,"unitPrice":0,"kind":"shared"}]}. '
+        "place es el nombre del negocio en el encabezado del recibo. "
+        "date es la fecha del consumo, convertida a formato YYYY-MM-DD. "
+        "subtotal es el monto antes de impuestos (base imponible) y total es el monto final a pagar, "
+        "incluyendo impuestos y cargos. Si no encuentras alguno de estos datos, usa null. "
+        'Usa kind="shared" para comida para compartir (pizzas, platos grandes, entradas para la mesa) y '
+        'kind="individual" para bebidas o platos individuales (cualquier bebida, cerveza, vino, refresco, '
+        "agua, jugo, coctel, o plato que normalmente pide y come una sola persona). "
+        "qty es la cantidad (numero entero) y unitPrice el precio unitario en pesos, sin simbolos ni "
+        "separadores de miles. Si el recibo muestra el precio total de la linea en vez del unitario, "
+        "calcula el unitario dividiendo el total entre la cantidad. "
+        "No incluyas como item las lineas de total, subtotal, impuestos, descuento, propina o cambio."
     )
 
     resp = requests.post(
@@ -229,7 +292,7 @@ def extract_invoice_items(file_bytes, mime_type):
         },
         json={
             "model": model,
-            "max_tokens": 1500,
+            "max_tokens": 1800,
             "messages": [{"role": "user", "content": [block, {"type": "text", "text": prompt}]}],
         },
         timeout=45,
@@ -237,8 +300,7 @@ def extract_invoice_items(file_bytes, mime_type):
     resp.raise_for_status()
     data = resp.json()
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-    parsed = _extract_json_object(text)
-    return parsed.get("items", [])
+    return _extract_json_object(text)
 
 
 def guess_mime(file_storage):
@@ -462,8 +524,10 @@ def api_calc():
 @app.route("/api/parse-invoice-text", methods=["POST"])
 def api_parse_text():
     data = request.get_json(force=True, silent=True) or {}
-    items = parse_invoice_text(data.get("text", ""))
-    return jsonify({"items": items})
+    text = data.get("text", "")
+    items = parse_invoice_text(text)
+    meta = detect_totals_and_meta(text)
+    return jsonify({"items": items, "meta": meta})
 
 
 @app.route("/api/extract-invoice", methods=["POST"])
@@ -481,17 +545,34 @@ def api_extract_invoice():
     if not raw:
         return jsonify({"error": "empty", "message": "El archivo llegó vacío."}), 200
 
+    # PDF: primero intenta leer el texto real del archivo (gratis, sin IA).
+    # Solo funciona si el PDF trae texto de verdad, no si es una foto/escaneo.
+    if mime == "application/pdf":
+        try:
+            pdf_text = extract_pdf_text(raw)
+        except Exception:
+            pdf_text = ""
+        if pdf_text and len(pdf_text) >= 20:
+            items = parse_invoice_text(pdf_text)
+            if items:
+                meta = detect_totals_and_meta(pdf_text)
+                return jsonify({"items": items, "meta": meta})
+        # si no se encontró texto util, sigue abajo e intenta con IA (si hay key)
+
     try:
-        items = extract_invoice_items(raw, mime)
+        parsed = extract_invoice_data(raw, mime)
     except MissingAPIKey:
-        return jsonify({
-            "error": "no_api_key",
-            "message": "La lectura automática necesita una ANTHROPIC_API_KEY configurada en Vercel. "
-                       "Mientras tanto, usa 'Pegar texto' o agrega los items a mano.",
-        }), 200
+        if mime == "application/pdf":
+            msg = ("Este PDF parece ser una foto o escaneo (no tiene texto real adentro), así que no se pudo "
+                   "leer sin IA. Usa 'Pegar texto' o agrega los items a mano.")
+        else:
+            msg = ("La lectura automática de fotos necesita una ANTHROPIC_API_KEY configurada en Vercel. "
+                   "Mientras tanto, usa 'Pegar texto' o agrega los items a mano.")
+        return jsonify({"error": "no_api_key", "message": msg}), 200
     except Exception as e:
         return jsonify({"error": "extract_failed", "message": f"No se pudo leer la factura: {e}"}), 200
 
+    items = parsed.get("items", []) if isinstance(parsed, dict) else []
     norm = []
     for it in items:
         desc = str(it.get("desc", "")).strip() or "Item"
@@ -503,7 +584,13 @@ def api_extract_invoice():
             "unitPrice": round(num(it.get("unitPrice"), 0)),
             "kind": kind,
         })
-    return jsonify({"items": norm})
+    meta = {
+        "place": parsed.get("place") if isinstance(parsed, dict) else None,
+        "date": parsed.get("date") if isinstance(parsed, dict) else None,
+        "subtotal": parsed.get("subtotal") if isinstance(parsed, dict) else None,
+        "total": parsed.get("total") if isinstance(parsed, dict) else None,
+    }
+    return jsonify({"items": norm, "meta": meta})
 
 
 @app.route("/api/export/pdf", methods=["POST"])
@@ -731,6 +818,9 @@ PAGE = r"""<!DOCTYPE html>
             Sube una foto o PDF de la factura para leerla automáticamente
             <input type="file" id="invoiceFile" accept="image/*,application/pdf">
           </label>
+          <div style="font-size:11.5px; color:var(--ink-soft); margin-top:6px;">
+            Los PDF con texto real (no escaneados) se leen sin costo. Las fotos necesitan IA configurada (opcional).
+          </div>
           <div class="divider">— o —</div>
           <label>Pega el texto de la factura</label>
           <textarea id="invoiceText" placeholder="Ej:&#10;2 Pizza mediana 24000&#10;Gaseosa 3000&#10;Cerveza 5000"></textarea>
@@ -836,16 +926,14 @@ function jsCalc(){
   const indivUnassigned=indivItems.filter(i=>!i.personId);
   const sharedCost=sharedItems.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
   const excess=Math.max(0,sharedCost-pool), surplus=Math.max(0,pool-sharedCost), covered=Math.min(sharedCost,pool);
-  const nonF=state.people.filter(p=>!(finesByPerson[p.id]>0));
-  let base=nonF, fallback=false; if(excess>0&&!nonF.length){ base=state.people; fallback=true; }
-  const per=base.length?excess/base.length:0; const ids=new Set(base.map(p=>p.id));
+  const per = state.people.length ? excess/state.people.length : 0;
   const rows=state.people.map(p=>{ const pold=finesByPerson[p.id]||0; const fine=pold*pv;
     const ex=indivAssigned.filter(i=>i.personId===p.id).reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
-    const sh=(excess>0&&ids.has(p.id))?per:0;
+    const sh=excess>0 ? per : 0;
     return {id:p.id,name:p.name||'(sin nombre)',poldinas:pold,fine,excessShare:sh,extras:ex,total:fine+ex+sh,fined:pold>0}; });
   const extrasTotal=indivAssigned.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
   const unassignedTotal=indivUnassigned.reduce((s,i)=>s+(+i.qty||0)*(+i.unitPrice||0),0);
-  return {totalPoldinas:totalPold,pool,sharedCost,covered,excess,surplus,extrasTotal,unassignedTotal,unassignedCount:indivUnassigned.length,grand:rows.reduce((s,r)=>s+r.total,0),excessPer:per,nonFinedCount:nonF.length,fallback,rows};
+  return {totalPoldinas:totalPold,pool,sharedCost,covered,excess,surplus,extrasTotal,unassignedTotal,unassignedCount:indivUnassigned.length,grand:rows.reduce((s,r)=>s+r.total,0),excessPer:per,rows};
 }
 
 /* ---------- helpers DOM ---------- */
@@ -976,8 +1064,7 @@ function renderStats(c){
   document.getElementById('vExtras').textContent=money(c.extrasTotal);
   document.getElementById('vGrand').textContent=money(c.grand);
   const nb=document.getElementById('noteBox'); nb.innerHTML='';
-  if(c.excess>0 && !c.fallback) nb.append(el('div',{class:'note warn'},`El consumo se paso por ${money(c.excess)}. Se reparte entre ${c.nonFinedCount} persona(s) sin multa -> ${money(c.excessPer)} c/u.`));
-  if(c.fallback) nb.append(el('div',{class:'note warn'},`Hay un exceso de ${money(c.excess)} pero nadie esta sin multa. Se repartio entre todas las personas (${money(c.excessPer)} c/u).`));
+  if(c.excess>0) nb.append(el('div',{class:'note warn'},`El consumo se paso por ${money(c.excess)}. Se reparte entre las ${state.people.length} persona(s) -> ${money(c.excessPer)} c/u.`));
   if(c.surplus>0) nb.append(el('div',{class:'note info'},`Las multas superan el consumo comun por ${money(c.surplus)} (bolsa sin usar).`));
   if(c.unassignedCount>0) nb.append(el('div',{class:'note warn'},`Hay ${money(c.unassignedTotal)} en ${c.unassignedCount} item(s) individuales sin asignar a nadie. Ve a "Factura" y elige quien lo consumio, o no se cobrara.`));
 }
@@ -1019,6 +1106,29 @@ function syncInputs(){
 }
 function renderAll(){ renderPeople(); renderFines(); renderItems(); refreshPersonSelects(); scheduleCalc(); }
 
+function applyInvoiceMeta(meta){
+  if(!meta) return;
+  if(meta.place && !state.event.place){
+    state.event.place = meta.place; document.getElementById('evPlace').value = meta.place;
+  }
+  if(meta.date && !state.event.date){
+    state.event.date = meta.date; document.getElementById('evDate').value = meta.date;
+  }
+  if(!state.event.name && meta.place){
+    state.event.name = 'Consumo en ' + meta.place; document.getElementById('evName').value = state.event.name;
+  }
+  save();
+}
+function addTaxDifferenceIfNeeded(meta){
+  if(!meta || !meta.total) return;
+  const sumStaging = staging.reduce((s,it)=> s+(+it.qty||0)*(+it.unitPrice||0), 0);
+  const diff = Math.round((+meta.total||0) - sumStaging);
+  if(diff > 1){
+    staging.push({desc:'Cargos e impuestos (ITBIS/Ley/servicio)', qty:1, unitPrice:diff, kind:'shared', personId:null});
+    toast('Se detecto un total de '+money(meta.total)+'. Se agrego la diferencia ('+money(diff)+') como cargo comun.');
+  }
+}
+
 /* ---------- factura: subir archivo / pegar texto ---------- */
 async function handleInvoiceFile(file){
   toast('Leyendo factura...');
@@ -1030,6 +1140,8 @@ async function handleInvoiceFile(file){
     if(data.error){ toast(data.message||'No se pudo leer la factura.'); return; }
     if(!data.items || !data.items.length){ toast('No se encontraron items en la factura.'); return; }
     staging = data.items.map(it=>({...it, personId:null}));
+    addTaxDifferenceIfNeeded(data.meta);
+    applyInvoiceMeta(data.meta);
     renderStaging(); toast(data.items.length+' item(s) leidos, revisalos abajo');
   }catch(e){ toast('No se pudo leer la factura (revisa la conexion)'); }
 }
@@ -1041,6 +1153,8 @@ async function handleInvoiceText(){
     const data=await res.json();
     if(!data.items || !data.items.length){ toast('No se reconocieron lineas. Revisa el formato o agrega a mano.'); return; }
     staging = data.items.map(it=>({...it, personId:null}));
+    addTaxDifferenceIfNeeded(data.meta);
+    applyInvoiceMeta(data.meta);
     renderStaging(); toast(data.items.length+' linea(s) reconocidas, revisalas abajo');
   }catch(e){ toast('No se pudo leer el texto'); }
 }
